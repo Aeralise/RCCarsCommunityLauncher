@@ -1,0 +1,4 @@
+PySide6>=6.7.0
+PyInstaller>=6.6.0
+# Optional: support 7z archives in the Mods tab.
+py7zr>=0.20.0
