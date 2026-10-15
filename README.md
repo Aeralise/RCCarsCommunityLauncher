@@ -1,4 +1,4 @@
-# RC Cars Launcher (prototype 0.1.3)
+# RC Cars Launcher (prototype 0.1.4)
 
 A Windows-oriented Python/Qt launcher and modding utility for **RC Cars (2003)**. This is the first functional project scaffold: source code is included; build the Windows EXE locally using the batch file.
 
@@ -7,7 +7,7 @@ A Windows-oriented Python/Qt launcher and modding utility for **RC Cars (2003)**
 - Multiple game instances with custom names and optional icons; Steam detection uses app ID `289460` and `appmanifest_289460.acf`.
 - Detects `RCCars.pack`, loose game directories, the WidescreenFix `.asi`/INI, `dinput8.dll`, and the PE Large Address Aware flag.
 - Uses `rccars_pack_tool.py` to extract all archive contents **directly into the game root**. Before overwritten loose files are replaced, they are backed up. After successful extraction, the archive is renamed in-place to `_RCCars.pack` (or a timestamped `_RCCars-*.pack` if that name already exists), so the game uses loose files while the original remains recoverable next to the game.
-- A single compatibility button installs the latest compiled WidescreenFix release and the official Win32 `dinput8.dll` package from Ultimate ASI Loader.
+- A single compatibility button checks the latest WidescreenFix release and the official Ultimate ASI Loader `Win32-latest` asset. It installs missing components and downloads/replaces only components whose recorded release token or local SHA-256 has changed; user INI settings are preserved.
 - Writes WidescreenFix INI values (`Width`, `Height`, `Aspect`, `FixFOV`, `CustomFOV`, `FixHUD`, `LegacyFixHUD`, `FPS/Limit`, `DEBUG/NoMinimize`) while preserving encoding, original CRLF/LF line endings, unrelated settings and comments. Newly created Windows-facing INIs use CRLF.
 - Patches two X-resolution and two Y-resolution entries in `RCCars.crs` only if that file exists and the expected record pattern is found. It refuses to write if the expected two records per axis aren't found. An original copy is backed up first.
 - Edits `Config.gm` flags for fog, gamma, and intro playback; writes the game's `Language` registry value on Windows. Russian is written as the exact game-specific token `Русский`, while the UI continues to display `Russian`.
@@ -26,7 +26,7 @@ Build on Windows (preferably Windows 10/11 x64) with Python 3.11 or 3.12 install
 build_exe.bat
 ```
 
-The script creates a **single-file** `dist\RCCarsLauncher.exe`. If `launcher_icon.ico` is present beside `build_exe.bat`, that file is embedded as the EXE icon and bundled for the UI header. Without it, a neutral system icon is shown in the header. Distribute it together with `launcher_config.json`, `social_links.json`, and the `Tools` folder from `dist`. The Qt/Python runtime is bundled into the EXE, which also makes the self-updater able to replace a single executable. Mutable settings, backups, mod profiles and staged updates are stored in a `data` folder next to the launcher EXE. Previous profile data in `%APPDATA%\Aeralise\RCCarsLauncher` is copied to this folder once when no portable `data\launcher.json` exists.
+The script creates a **one-directory** build under `dist\RCCarsLauncher\`, with `RCCarsLauncher.exe` and the bundled Qt/Python runtime in `_runtime`. It also creates `dist\RCCarsLauncher_Portable.zip`, whose root contains the EXE and `_runtime`; attach this ZIP to GitHub Releases for safe in-app updates. If `launcher_icon.ico` is present beside `build_exe.bat`, it is embedded as the EXE icon and copied beside the app for the UI header. Distribute the complete `RCCarsLauncher` folder, not just the EXE. This build starts faster than PyInstaller's one-file mode because it does not extract the whole runtime into a temporary folder on each launch. Mutable settings, backups, mod profiles and staged updates remain in a `data` folder beside the EXE. Previous profile data in `%APPDATA%\Aeralise\RCCarsLauncher` is copied to this folder once when no portable `data\launcher.json` exists.
 
 For running from source:
 
@@ -41,9 +41,9 @@ py -3 launcher.py
 
 For the full step-by-step repository/release setup, see [`docs/GITHUB_UPDATES.md`](docs/GITHUB_UPDATES.md).
 
-The combined compatibility installer checks `https://api.github.com/repos/Aeralise/RCCars_WidescreenFix/releases/latest` and chooses compiled `.asi`/`.ini` files from the release assets, then installs Ultimate ASI Loader's `Win32-latest/dinput8-Win32.zip` because RC Cars is a 32-bit game.
+The combined compatibility installer checks the latest WidescreenFix GitHub Release and Ultimate ASI Loader's moving `Win32-latest` x86 asset. It records the upstream release token and installed file SHA-256 per instance: the next click checks for updates, downloads only changed components, and leaves the existing WidescreenFix INI intact. The loader is taken from `Win32-latest/dinput8-Win32.zip` because RC Cars is a 32-bit game.
 
-The launcher's own self-updater needs a GitHub repository with Releases for the launcher itself. Set `launcher_update_repo` in `launcher_config.json` to `owner/repository`, publish a Release and attach the built `RCCarsLauncher.exe` as an asset. Until then the self-update check will report that the repository is not configured. Update releases should use a matching release tag/version convention.
+The launcher's self-updater needs a GitHub repository with Releases. Set `launcher_update_repo` in `launcher_config.json` to `owner/repository` and attach `RCCarsLauncher_Portable.zip` to every release (the updater prefers it over a direct EXE because this is a one-directory build). The ZIP must contain `RCCarsLauncher.exe` and `_runtime/` at its root. Update releases should use tags matching `APP_VERSION`, e.g. `v0.1.4`.
 
 ## Notes / safety
 
@@ -76,7 +76,7 @@ RCCarsLauncher/
 
 ## Launcher self-update release asset
 
-Name the release asset `RCCarsLauncher.exe`. The updater downloads the release EXE to a staging folder and uses a small Windows command script to replace the running executable after it exits. This assumes a single-file PyInstaller build (the provided build script uses `--onefile`).
+Attach `RCCarsLauncher_Portable.zip` to the release. The archive should contain `RCCarsLauncher.exe` and the `_runtime/` directory directly at its root; the provided build script creates this ZIP automatically. The updater downloads and validates the package, stages the new runtime, waits for the launcher process to exit, swaps `_runtime` and the EXE, then restarts the launcher. It preserves the mutable `data`, `Tools`, `launcher_config.json`, and `social_links.json` belonging to the current installation. A direct `RCCarsLauncher.exe` asset remains a legacy fallback for old one-file releases, but should not be used for new onedir releases.
 
 ## Run regression tests
 

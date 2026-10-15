@@ -3,6 +3,7 @@ from __future__ import annotations
 import configparser
 import ctypes
 import json
+import hashlib
 import mmap
 import os
 import re
@@ -667,11 +668,12 @@ def install_asi_loader(game_root: Path, backup_root: Path,
 
 
 def install_widescreen_fix(game_root: Path, backup_root: Path,
-                           progress: Optional[Callable[[int, str], None]] = None) -> str:
+                           progress: Optional[Callable[[int, str], None]] = None,
+                           release_info: Optional[dict[str, Any]] = None) -> str:
     api_url = f"https://api.github.com/repos/{WSF_REPO}/releases/latest"
     if progress:
         progress(1, "Checking the latest RC Cars WidescreenFix release…")
-    release = github_json(api_url)
+    release = release_info or github_json(api_url)
     assets = release.get("assets", [])
     if not assets:
         raise RuntimeError(f"Release {release.get('tag_name', '?')} has no downloadable assets")
@@ -739,28 +741,127 @@ def install_widescreen_fix(game_root: Path, backup_root: Path,
     return f"Installed RC Cars WidescreenFix {release.get('tag_name', 'latest')}: {', '.join(installed) or 'plugin refreshed; existing INI preserved'}."
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _component_state_path(backup_root: Path) -> Path:
+    return backup_root / "component_versions.json"
+
+
+def _read_component_state(backup_root: Path) -> dict[str, Any]:
+    return read_json(_component_state_path(backup_root), {"components": {}})
+
+
+def _component_is_current(game_root: Path, state: dict[str, Any], key: str,
+                          filename: str, version: str) -> bool:
+    target = game_root / filename
+    record = state.get("components", {}).get(key, {})
+    if not target.is_file() or not record or str(record.get("version", "")) != version:
+        return False
+    try:
+        return _sha256_file(target) == str(record.get("sha256", ""))
+    except OSError:
+        return False
+
+
+def _record_component(game_root: Path, state: dict[str, Any], key: str,
+                      filename: str, version: str) -> None:
+    target = game_root / filename
+    if not target.is_file():
+        raise FileNotFoundError(f"Installed component is missing: {target}")
+    state.setdefault("components", {})[key] = {
+        "version": version,
+        "sha256": _sha256_file(target),
+        "filename": filename,
+    }
+
+
+def _asi_loader_update_token() -> str:
+    """Return a token that changes with the official Win32-latest asset.
+
+    Win32-latest is a moving release tag rather than a semantic version. Asset
+    digest/updated_at/size are therefore better update markers than its tag name.
+    """
+    release = github_json(f"https://api.github.com/repos/{ASI_LOADER_REPO}/releases/tags/Win32-latest")
+    assets = release.get("assets", [])
+    asset = next((a for a in assets if str(a.get("name", "")).lower() == "dinput8-win32.zip"), None)
+    if asset is None:
+        # Fall back to the moving Git ref if GitHub omits the expected asset
+        # from release metadata, but still fail clearly if its version is unknown.
+        ref = github_json(f"https://api.github.com/repos/{ASI_LOADER_REPO}/git/ref/tags/Win32-latest")
+        token = str(ref.get("object", {}).get("sha", "")).strip()
+    else:
+        parts = [str(asset.get("digest", "")), str(asset.get("updated_at", "")), str(asset.get("size", ""))]
+        token = "|".join(part for part in parts if part)
+        if not token:
+            ref = github_json(f"https://api.github.com/repos/{ASI_LOADER_REPO}/git/ref/tags/Win32-latest")
+            token = str(ref.get("object", {}).get("sha", "")).strip()
+    if not token:
+        raise RuntimeError("Could not determine the current Ultimate ASI Loader Win32-latest revision")
+    return token
+
+
 def install_compatibility_components(game_root: Path, backup_root: Path,
                                      progress: Optional[Callable[[int, str], None]] = None) -> str:
-    """Install both Win32 Ultimate ASI Loader and the latest RC Cars WidescreenFix."""
-    def loader_progress(value: int, message: str) -> None:
-        if progress:
-            progress(max(0, min(45, round(value * 0.45))), f"ASI Loader: {message}")
+    """Install missing components and update only when their official source changed.
 
-    def fix_progress(value: int, message: str) -> None:
-        if progress:
-            progress(max(45, min(100, 45 + round(value * 0.55))), f"WidescreenFix: {message}")
-
-    loader_message = install_asi_loader(game_root, backup_root, loader_progress)
-    try:
-        fix_message = install_widescreen_fix(game_root, backup_root, fix_progress)
-    except Exception as exc:
-        raise RuntimeError(
-            "ASI Loader was installed, but WidescreenFix installation failed. "
-            f"Details: {exc}"
-        ) from exc
+    The installed version is recorded per game instance. SHA-256 checks also detect
+    local/manual replacement of the .asi or DLL, in which case the latest file is
+    installed again rather than incorrectly reporting the component as current.
+    """
     if progress:
-        progress(100, "ASI Loader and WidescreenFix installed")
-    return loader_message + "\n" + fix_message
+        progress(1, "Checking official GitHub releases…")
+    wsf_release = github_json(f"https://api.github.com/repos/{WSF_REPO}/releases/latest")
+    wsf_version = str(wsf_release.get("tag_name") or wsf_release.get("published_at") or "latest")
+    loader_version = _asi_loader_update_token()
+    state = _read_component_state(backup_root)
+
+    loader_file = "dinput8.dll"
+    fix_file = "RCCars_WidescreenFix.asi"
+    loader_current = _component_is_current(game_root, state, "asi_loader", loader_file, loader_version)
+    fix_current = _component_is_current(game_root, state, "widescreen_fix", fix_file, wsf_version)
+    messages: list[str] = []
+
+    if loader_current and fix_current:
+        ini_path = game_root / "RCCars_WidescreenFix.ini"
+        if not ini_path.exists():
+            ensure_widescreen_ini(ini_path, 0, 0)
+        if progress:
+            progress(100, "WidescreenFix and ASI Loader are already up to date")
+        return (f"Components are up to date. Ultimate ASI Loader revision {loader_version[:12]}, "
+                f"WidescreenFix {wsf_version}. No downloads were necessary.")
+
+    if not loader_current:
+        def loader_progress(value: int, message: str) -> None:
+            if progress:
+                progress(max(3, min(48, round(value * 0.45))), f"ASI Loader: {message}")
+        messages.append(install_asi_loader(game_root, backup_root, loader_progress))
+        _record_component(game_root, state, "asi_loader", loader_file, loader_version)
+        write_json(_component_state_path(backup_root), state)
+    else:
+        messages.append(f"Ultimate ASI Loader is up to date (revision {loader_version[:12]}).")
+
+    if not fix_current:
+        def fix_progress(value: int, message: str) -> None:
+            if progress:
+                progress(max(48, min(98, 48 + round(value * 0.50))), f"WidescreenFix: {message}")
+        messages.append(install_widescreen_fix(game_root, backup_root, fix_progress, release_info=wsf_release))
+        _record_component(game_root, state, "widescreen_fix", fix_file, wsf_version)
+        write_json(_component_state_path(backup_root), state)
+    else:
+        messages.append(f"WidescreenFix is up to date ({wsf_version}).")
+
+    ini_path = game_root / "RCCars_WidescreenFix.ini"
+    if not ini_path.exists():
+        ensure_widescreen_ini(ini_path, 0, 0)
+    if progress:
+        progress(100, "Compatibility components checked and updated")
+    return "\n".join(messages)
 
 
 def check_launcher_update(repo: str) -> Optional[dict[str, Any]]:
@@ -769,13 +870,29 @@ def check_launcher_update(repo: str) -> Optional[dict[str, Any]]:
         raise ValueError("Set launcher_update_repo in launcher_config.json to 'owner/repository' first.")
     release = github_json(f"https://api.github.com/repos/{repo}/releases/latest")
     assets = release.get("assets", [])
-    exe_assets = [a for a in assets if Path(a.get("name", "")).suffix.lower() == ".exe"]
-    if not exe_assets:
-        zip_assets = [a for a in assets if Path(a.get("name", "")).suffix.lower() == ".zip"]
-        if zip_assets:
-            raise RuntimeError("Latest release has ZIP assets but no direct EXE asset. Publish RCCarsLauncher.exe as a release asset to enable in-app updates.")
-        raise RuntimeError("Latest GitHub release has no .exe asset")
-    preferred = next((a for a in exe_assets if "rccarslauncher" in a.get("name", "").lower()), exe_assets[0])
+
+    # Prefer a complete one-directory package, because it contains the EXE and
+    # PyInstaller's external runtime DLLs. An EXE-only update is unsafe for an
+    # onedir build. Keep EXE fallback for historical one-file releases.
+    package_assets = [
+        a for a in assets
+        if Path(a.get("name", "")).suffix.lower() == ".zip"
+        and "rccarslauncher" in a.get("name", "").lower()
+        and not any(term in a.get("name", "").lower() for term in ("source", "src", "sourcecode"))
+    ]
+    preferred_package = next(
+        (a for a in package_assets if any(term in a.get("name", "").lower() for term in ("portable", "package", "launcher"))),
+        package_assets[0] if package_assets else None,
+    )
+    if preferred_package:
+        preferred = preferred_package
+    else:
+        exe_assets = [a for a in assets if Path(a.get("name", "")).suffix.lower() == ".exe"]
+        if not exe_assets:
+            if any(Path(a.get("name", "")).suffix.lower() == ".zip" for a in assets):
+                raise RuntimeError("Latest release has no RCCarsLauncher package ZIP or direct EXE. Attach RCCarsLauncher_Portable.zip for one-directory builds.")
+            raise RuntimeError("Latest GitHub release has no launcher EXE or package ZIP asset")
+        preferred = next((a for a in exe_assets if "rccarslauncher" in a.get("name", "").lower()), exe_assets[0])
     return {"tag": release.get("tag_name", "latest"), "name": release.get("name", ""),
             "url": release.get("html_url", f"https://github.com/{repo}/releases"),
             "asset_name": preferred.get("name"), "asset_url": preferred.get("browser_download_url"),
@@ -783,16 +900,120 @@ def check_launcher_update(repo: str) -> Optional[dict[str, Any]]:
 
 
 def prepare_self_update(asset_url: str, asset_name: str, progress=None) -> tuple[Path, Path]:
-    """Download and stage a new EXE plus a Windows cmd script that swaps it after exit."""
+    """Stage a launcher EXE or a complete onedir package and create a Windows swap script."""
     if not getattr(sys, "frozen", False):
-        raise RuntimeError("Self-replacement is available only for the packaged EXE. In source mode, download the release manually.")
+        raise RuntimeError("Self-replacement is available only for the packaged launcher. In source mode, download the release manually.")
     exe_path = Path(sys.executable).resolve()
     payload = download_bytes(asset_url, progress, "Downloading launcher update")
-    if not payload.startswith(b"MZ"):
-        raise RuntimeError("Release asset is not a Windows executable")
     stage = user_data_dir() / "updates"
     stage.mkdir(parents=True, exist_ok=True)
-    staged_exe = stage / Path(asset_name).name
+    safe_name = Path(asset_name).name
+
+    if safe_name.lower().endswith(".zip"):
+        from io import BytesIO
+        stage_payload = stage / "payload"
+        if stage_payload.exists():
+            shutil.rmtree(stage_payload)
+        stage_payload.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(BytesIO(payload)) as archive:
+                members = [m for m in archive.infolist() if not m.is_dir()]
+                normalized: list[tuple[zipfile.ZipInfo, PurePosixPath]] = []
+                for member in members:
+                    raw_name = member.filename.replace("\\", "/")
+                    relative = PurePosixPath(raw_name)
+                    if relative.is_absolute() or any(part in ("..", "") for part in relative.parts):
+                        raise RuntimeError(f"Unsafe path in launcher update package: {member.filename}")
+                    normalized.append((member, relative))
+                # Support both archive-root files and an optional one-folder wrapper.
+                prefix: tuple[str, ...] = ()
+                if not any(tuple(p.parts) == ("RCCarsLauncher.exe",) for _, p in normalized):
+                    candidates = [p.parts for _, p in normalized if p.name.lower() == "rccarslauncher.exe" and len(p.parts) >= 2]
+                    if candidates and all(parts[0] == candidates[0][0] for parts in candidates):
+                        prefix = (candidates[0][0],)
+                extracted_runtime = False
+                extracted_exe: Optional[Path] = None
+                for member, relative in normalized:
+                    parts = relative.parts
+                    if prefix:
+                        if parts[:1] != prefix:
+                            continue
+                        parts = parts[1:]
+                    if not parts:
+                        continue
+                    rel = PurePosixPath(*parts)
+                    # Only extract the launcher binary and its private PyInstaller runtime.
+                    if not (rel.as_posix() == "RCCarsLauncher.exe" or rel.parts[0] == "_runtime"):
+                        continue
+                    dest = stage_payload.joinpath(*rel.parts)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(member, "r") as src, dest.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    if rel.as_posix() == "RCCarsLauncher.exe":
+                        extracted_exe = dest
+                    elif rel.parts[0] == "_runtime":
+                        extracted_runtime = True
+                if extracted_exe is None or not extracted_exe.is_file() or not extracted_exe.read_bytes()[:2] == b"MZ":
+                    raise RuntimeError("Launcher package ZIP does not contain a valid root RCCarsLauncher.exe")
+                if not extracted_runtime or not (stage_payload / "_runtime").is_dir():
+                    raise RuntimeError("Launcher package ZIP does not contain the _runtime directory. Build and upload RCCarsLauncher_Portable.zip.")
+        except zipfile.BadZipFile as exc:
+            raise RuntimeError("Downloaded launcher package is not a valid ZIP archive") from exc
+        staged_exe = stage_payload / "RCCarsLauncher.exe"
+        script = stage / "apply_launcher_package_update.cmd"
+        target_dir = str(exe_path.parent)
+        source_dir = str(stage_payload)
+        script_text = (
+            "@echo off\r\nsetlocal EnableExtensions\r\n"
+            f'set "TARGET_DIR={target_dir}"\r\nset "SOURCE_DIR={source_dir}"\r\n'
+            ":waitloop\r\ntimeout /t 1 /nobreak >nul\r\n"
+            r'if not exist "%SOURCE_DIR%\RCCarsLauncher.exe" goto :waitloop' + "\r\n"
+
+            r'if not exist "%SOURCE_DIR%\_runtime" goto :waitloop' + "\r\n"
+
+            r'if exist "%TARGET_DIR%\_runtime.new" rmdir /s /q "%TARGET_DIR%\_runtime.new"' + "\r\n"
+
+            r'xcopy "%SOURCE_DIR%\_runtime\*" "%TARGET_DIR%\_runtime.new" /E /I /H /K /Y >nul' + "\r\n"
+
+            r'if errorlevel 1 goto :waitloop' + "\r\n"
+
+            r'if exist "%TARGET_DIR%\_runtime.old" rmdir /s /q "%TARGET_DIR%\_runtime.old"' + "\r\n"
+
+            r'if exist "%TARGET_DIR%\_runtime" ren "%TARGET_DIR%\_runtime" "_runtime.old"' + "\r\n"
+
+            r'ren "%TARGET_DIR%\_runtime.new" "_runtime" >nul 2>&1' + "\r\n"
+
+            r'if errorlevel 1 goto :rollback' + "\r\n"
+
+            r'copy /y "%SOURCE_DIR%\RCCarsLauncher.exe" "%TARGET_DIR%\RCCarsLauncher.exe" >nul' + "\r\n"
+
+            r'if errorlevel 1 goto :rollback' + "\r\n"
+
+            r'if exist "%TARGET_DIR%\_runtime.old" rmdir /s /q "%TARGET_DIR%\_runtime.old"' + "\r\n"
+
+            r'start "" "%TARGET_DIR%\RCCarsLauncher.exe"' + "\r\n"
+
+            r'rmdir /s /q "%SOURCE_DIR%" >nul 2>&1' + "\r\n"
+
+            r'del "%~f0" >nul 2>&1' + "\r\n"
+
+            'exit /b 0\r\n'
+            ':rollback\r\n'
+            r'if exist "%TARGET_DIR%\_runtime" rmdir /s /q "%TARGET_DIR%\_runtime"' + "\r\n"
+
+            r'if exist "%TARGET_DIR%\_runtime.old" ren "%TARGET_DIR%\_runtime.old" "_runtime"' + "\r\n"
+
+            'goto :waitloop\r\n'
+            'endlocal\r\n'
+        )
+        script.write_text(script_text, encoding="utf-8")
+        if progress:
+            progress(100, "Launcher package staged")
+        return staged_exe, script
+
+    if not payload.startswith(b"MZ"):
+        raise RuntimeError("Release asset is neither a Windows executable nor a supported launcher package ZIP")
+    staged_exe = stage / Path(safe_name).name
     staged_exe.write_bytes(payload)
     bat = stage / "apply_launcher_update.cmd"
     target = str(exe_path)
@@ -800,8 +1021,7 @@ def prepare_self_update(asset_url: str, asset_name: str, progress=None) -> tuple
     bat.write_text(
         "@echo off\r\nsetlocal\r\n"
         f'set "TARGET={target}"\r\nset "SOURCE={source}"\r\n'
-        ":waitloop\r\n"
-        "timeout /t 1 /nobreak >nul\r\n"
+        ":waitloop\r\ntimeout /t 1 /nobreak >nul\r\n"
         'copy /y "%SOURCE%" "%TARGET%" >nul 2>&1\r\n'
         'if errorlevel 1 goto waitloop\r\n'
         'start "" "%TARGET%"\r\n'
@@ -809,6 +1029,8 @@ def prepare_self_update(asset_url: str, asset_name: str, progress=None) -> tuple
         'del "%~f0" >nul 2>&1\r\n'
         "endlocal\r\n", encoding="utf-8"
     )
+    if progress:
+        progress(100, "Launcher EXE staged")
     return staged_exe, bat
 
 

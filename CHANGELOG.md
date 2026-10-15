@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4
+- Wrap every content page in a vertical scroll area to prevent controls/text from being compressed on smaller windows; reduce minimum window size.
+- Make WidescreenFix + ASI Loader action install missing components and check/update only changed official releases using recorded release tokens and local SHA-256 checks. Existing WidescreenFix INI settings remain untouched.
+- Defer initial filesystem/status refresh until after the window is shown and refresh only essential Home data on startup.
+- Switch from PyInstaller one-file to one-directory build with runtime modules in `_runtime` to avoid unpacking Qt/Python runtime on every startup.
+- Generate `RCCarsLauncher_Portable.zip` for GitHub Releases and update the self-updater to stage/swap the EXE plus `_runtime`, preserving user data/config/tools.
+
 ## 0.1.3
 - Detect Pack as unpacked for new instances when RCCars.pack is absent and retained archive or known loose game folders are present.
 - Show Pack status in the Instances table.

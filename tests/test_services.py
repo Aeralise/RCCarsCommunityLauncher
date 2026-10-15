@@ -122,18 +122,68 @@ def test_new_ini_defaults_use_crlf():
         assert b"\n" not in raw.replace(b"\r\n", b"")
 
 
-def test_combined_installer_runs_both_components():
+def test_compatibility_installer_skips_current_components_and_updates_changed_release():
     messages = []
+    remote = {"wsf": "v1.5", "loader": "loader-sha-1"}
+
     def progress(value, message):
         messages.append((value, message))
-    with tempfile.TemporaryDirectory() as td, \
-         patch.object(services, "install_asi_loader", return_value="loader installed") as loader, \
-         patch.object(services, "install_widescreen_fix", return_value="fix installed") as fix:
-        result = services.install_compatibility_components(Path(td), Path(td) / "backup", progress)
-        loader.assert_called_once()
-        fix.assert_called_once()
-        assert "loader installed" in result and "fix installed" in result
-        assert messages[-1][0] == 100
+
+    def api_response(url):
+        if f"repos/{services.WSF_REPO}/releases/latest" in url:
+            return {"tag_name": remote["wsf"], "assets": []}
+        if url.endswith("/releases/tags/Win32-latest"):
+            return {"tag_name": "Win32-latest", "assets": [{"name": "dinput8-Win32.zip", "digest": remote["loader"], "updated_at": remote["loader"], "size": 4567}]}
+        raise AssertionError(f"Unexpected GitHub API URL: {url}")
+
+    def fake_loader(root, backup, callback=None):
+        (root / "dinput8.dll").write_bytes(b"MZ fake ASI loader")
+        if callback:
+            callback(100, "fake loader downloaded")
+        return "loader installed"
+
+    def fake_fix(root, backup, callback=None, release_info=None):
+        assert release_info["tag_name"] == remote["wsf"]
+        (root / "RCCars_WidescreenFix.asi").write_bytes(b"fake widescreen fix " + remote["wsf"].encode())
+        if callback:
+            callback(100, "fake fix downloaded")
+        return "fix installed"
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "game"; root.mkdir()
+        backup = Path(td) / "backup"
+        with patch.object(services, "github_json", side_effect=api_response), \
+             patch.object(services, "install_asi_loader", side_effect=fake_loader) as loader, \
+             patch.object(services, "install_widescreen_fix", side_effect=fake_fix) as fix:
+            first = services.install_compatibility_components(root, backup, progress)
+            loader.assert_called_once()
+            fix.assert_called_once()
+            assert "loader installed" in first and "fix installed" in first
+            assert messages[-1][0] == 100
+
+            loader.reset_mock(); fix.reset_mock()
+            second = services.install_compatibility_components(root, backup, progress)
+            loader.assert_not_called()
+            fix.assert_not_called()
+            assert "up to date" in second.lower()
+
+            remote["wsf"] = "v1.6"
+            third = services.install_compatibility_components(root, backup, progress)
+            loader.assert_not_called()
+            fix.assert_called_once()
+            state = services._read_component_state(backup)
+            assert state["components"]["widescreen_fix"]["version"] == "v1.6"
+
+
+def test_component_file_hash_detects_manual_replacement():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "game"; root.mkdir()
+        backup = Path(td) / "backup"; backup.mkdir()
+        dll = root / "dinput8.dll"; dll.write_bytes(b"version one")
+        state = {"components": {"asi_loader": {"version": "abc123", "sha256": services._sha256_file(dll)}}}
+        assert services._component_is_current(root, state, "asi_loader", "dinput8.dll", "abc123")
+        dll.write_bytes(b"manually replaced")
+        assert not services._component_is_current(root, state, "asi_loader", "dinput8.dll", "abc123")
 
 
 def test_crs_patch_two_fields_each_axis():
@@ -266,3 +316,47 @@ if __name__ == "__main__":
     test_steam_laa_patch_is_refused()
     test_mod_overlay_and_restore()
     print("All tests passed")
+
+
+def test_launcher_update_prefers_portable_runtime_zip_over_exe():
+    release = {
+        "tag_name": "v0.1.5",
+        "name": "RC Cars Launcher 0.1.5",
+        "html_url": "https://github.com/example/RCCarsLauncher/releases/tag/v0.1.5",
+        "assets": [
+            {"name": "RCCarsLauncher.exe", "browser_download_url": "https://example/launcher.exe", "size": 1000},
+            {"name": "RCCarsLauncher_Portable.zip", "browser_download_url": "https://example/launcher.zip", "size": 5000},
+        ],
+    }
+    with patch.object(services, "github_json", return_value=release):
+        result = services.check_launcher_update("example/RCCarsLauncher")
+    assert result["asset_name"] == "RCCarsLauncher_Portable.zip"
+    assert result["asset_url"] == "https://example/launcher.zip"
+
+
+def test_prepare_self_update_extracts_only_exe_and_runtime_from_portable_zip():
+    from io import BytesIO
+    from unittest.mock import patch
+
+    archive_bytes = BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("RCCarsLauncher.exe", b"MZlauncher-binary")
+        archive.writestr("_runtime/Python.dll", b"python-runtime")
+        archive.writestr("_runtime/PySide6/QtCore.pyd", b"qt-runtime")
+        archive.writestr("launcher_config.json", b'{"launcher_update_repo":"example/repo"}')
+        archive.writestr("data/launcher.json", b'{"instances":[]}')
+
+    with tempfile.TemporaryDirectory() as td:
+        data_dir = Path(td) / "launcher-data"
+        with patch.object(services, "user_data_dir", return_value=data_dir), \
+             patch.object(services, "download_bytes", return_value=archive_bytes.getvalue()), \
+             patch.object(services.sys, "frozen", True, create=True):
+            staged_exe, cmd = services.prepare_self_update("https://example/launcher.zip", "RCCarsLauncher_Portable.zip")
+        assert staged_exe.read_bytes().startswith(b"MZ")
+        assert (staged_exe.parent / "_runtime" / "Python.dll").read_bytes() == b"python-runtime"
+        assert (staged_exe.parent / "_runtime" / "PySide6" / "QtCore.pyd").read_bytes() == b"qt-runtime"
+        assert not (staged_exe.parent / "launcher_config.json").exists()
+        assert not (staged_exe.parent / "data").exists()
+        script = cmd.read_text(encoding="utf-8")
+        assert "_runtime.old" in script
+        assert "RCCarsLauncher.exe" in script

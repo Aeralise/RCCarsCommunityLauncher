@@ -1,6 +1,6 @@
 # Настройка GitHub для обновлений RC Cars Launcher
 
-Лаунчер проверяет **опубликованный GitHub Release**, а не просто последний commit в исходниках. Он обращается к публичному API `GET https://api.github.com/repos/OWNER/REPOSITORY/releases/latest` и ищет среди файлов релиза Windows-файл с расширением `.exe` (предпочтительное имя — `RCCarsLauncher.exe`). Поэтому основной код можно хранить в репозитории, но для автоматического обновления обязательно публиковать собранный EXE как asset релиза.
+Лаунчер проверяет **опубликованный GitHub Release**, а не просто последний commit в исходниках. Он обращается к публичному API `GET https://api.github.com/repos/OWNER/REPOSITORY/releases/latest` и прежде всего ищет asset `RCCarsLauncher_Portable.zip`. Это важно для сборки PyInstaller `--onedir`: требуется обновлять не только EXE, но и папку `_runtime` с Qt/Python DLL. Старый asset `RCCarsLauncher.exe` поддерживается как совместимость с прежними one-file-релизами, но новые релизы должны содержать полный ZIP-пакет.
 
 Официальная документация GitHub: [Creating/managing releases](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository) и [REST API — latest release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release).
 
@@ -47,16 +47,16 @@ git push -u origin main
 
 ## 4. Собрать EXE для релиза
 
-На Windows 10/11 установи Python 3.11/3.12. Перед сборкой помести пользовательскую иконку в файл `launcher_icon.ico` в корне проекта (если иконка нужна). Запусти `build_exe.bat`. После успешной сборки проверь `dist\RCCarsLauncher.exe` запуском на тестовой папке игры.
+На Windows 10/11 установи Python 3.11/3.12. Перед сборкой помести пользовательскую иконку в файл `launcher_icon.ico` в корне проекта (если иконка нужна). Запусти `build_exe.bat`. После успешной сборки проверь `dist\RCCarsLauncher\RCCarsLauncher.exe` запуском на тестовой папке игры. Рядом будет создан `dist\RCCarsLauncher_Portable.zip`; он содержит EXE и `_runtime` на корневом уровне архива.
 
-## 5. Создать первый Release с EXE
+## 5. Создать первый Release с пакетом лаунчера
 
 1. Открой репозиторий на GitHub и перейди в **Releases → Draft a new release** (или **Create a new release**).
-2. Создай tag, например `v0.1.3`, укажи его для ветки `main` и задай заголовок `RC Cars Launcher 0.1.3`.
+2. Создай tag, например `v0.1.4`, укажи его для ветки `main` и задай заголовок `RC Cars Launcher 0.1.4`.
 3. Добавь release notes: ключевые изменения и известные ограничения.
-4. Перетащи **`dist\RCCarsLauncher.exe`** в область прикрепления файлов релиза. Имя файла должно быть `RCCarsLauncher.exe` (это имя предпочитает текущий updater).
+4. Перетащи **`dist\RCCarsLauncher_Portable.zip`** в область прикрепления файлов релиза. Не перепаковывай папку так, чтобы внутри ZIP появился лишний уровень вложенности; архив должен содержать `RCCarsLauncher.exe` и `_runtime\` прямо в корне. Можно дополнительно приложить `RCCarsLauncher.exe` для ручного запуска, но автообновление предпочитает ZIP-пакет.
 5. Нажми **Publish release**. Оставь release опубликованным, не Draft и не Pre-release: endpoint `releases/latest` их не рассматривает как latest stable release.
-6. В установленном лаунчере открой **Settings & Updates → Check for launcher updates**. Убедись, что репозиторий сохранён и новая версия определяется.
+6. В установленном лаунчере открой **Settings & Updates → Check for launcher updates**. Убедись, что репозиторий сохранён, новая версия определяется и в качестве asset выбран `RCCarsLauncher_Portable.zip`.
 
 Не нужно загружать EXE в обычный список файлов исходников: для текущего updater нужен именно asset опубликованного Release.
 
@@ -64,18 +64,18 @@ git push -u origin main
 
 При следующем обновлении:
 
-1. В `rccars_launcher/ui.py` увеличь `APP_VERSION`, например `0.1.3` → `0.1.4`.
+1. В `rccars_launcher/ui.py` увеличь `APP_VERSION`, например `0.1.4` → `0.1.5`.
 2. Обнови `CHANGELOG.md` и при необходимости `README.md`.
 3. Запусти тесты: `py -3 -m pytest -q`.
-4. Собери новый EXE на Windows и протестируй его.
-5. Создай новый Release с tag `v0.1.4` и прикрепи новый `RCCarsLauncher.exe`.
+4. Собери новую папку приложения на Windows и протестируй её. Скрипт создаст `RCCarsLauncher_Portable.zip` автоматически.
+5. Создай новый Release с tag `v0.1.5` и прикрепи новый `RCCarsLauncher_Portable.zip`.
 
 При проверке лаунчер сравнивает числа в версии тега с `APP_VERSION`. Для предсказуемого сравнения используй теги вида `vMAJOR.MINOR.PATCH`: `v0.1.4`, `v0.2.0`, `v1.0.0`.
 
 ## Важные детали
 
 - Не загружай токен GitHub в `launcher_config.json`: для публичного репозитория он не нужен.
-- Убедись, что EXE действительно приложен к Release. Один лишь source-code ZIP, автоматически генерируемый GitHub, не подходит для текущего автообновления.
-- Если проверка сообщает, что нет `.exe` asset, проверь именно опубликованный **latest stable Release** и точное имя прикреплённого EXE.
-- Автообновление заменяет запущенный EXE после его завершения. Рядом с ним сохраняется portable-папка `data`; отдельно поставляемые `launcher_config.json`, `social_links.json` и `Tools` не затираются EXE-обновлением.
-- Первую версию лаунчера нужно скачать/установить вручную. Встроенное автообновление начинает работать после того, как настроен репозиторий и опубликован Release с EXE.
+- Убедись, что `RCCarsLauncher_Portable.zip` действительно приложен к Release. Один лишь source-code ZIP, автоматически генерируемый GitHub, не подходит для автообновления.
+- Если проверка обновлений не находит пакет, проверь именно опубликованный **latest stable Release** и наличие `RCCarsLauncher_Portable.zip` среди Assets.
+- Автообновление заменяет EXE и `_runtime` после завершения приложения. Существующие `data`, `launcher_config.json`, `social_links.json` и `Tools` сохраняются. Обновляющий ZIP должен содержать только нужный пакет; скрипт извлекает только EXE и `_runtime`.
+- Первую версию лаунчера нужно скачать/установить вручную. Встроенное автообновление начинает работать после того, как настроен репозиторий и опубликован Release с `RCCarsLauncher_Portable.zip`.

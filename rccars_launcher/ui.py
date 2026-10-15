@@ -11,14 +11,14 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from PySide6.QtCore import Qt, QRunnable, QThreadPool, QObject, Signal, QSize, Slot
+from PySide6.QtCore import Qt, QRunnable, QThreadPool, QObject, Signal, QSize, Slot, QTimer
 from PySide6.QtGui import QIcon, QFont, QAction
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressDialog, QPushButton,
     QScrollArea, QSlider, QSpinBox, QStackedWidget, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget, QAbstractItemView, QStyle,
+    QTableWidgetItem, QVBoxLayout, QWidget, QAbstractItemView, QStyle, QSizePolicy, QLayout,
 )
 
 from . import services
@@ -27,7 +27,7 @@ from .modmanager import (
     scan_mods,
 )
 
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.1.4"
 
 RU = {
     "Home": "Главная", "Instances": "Копии игры", "Game Settings": "Настройки игры",
@@ -46,7 +46,8 @@ RU = {
     "Unknown": "Не определено", "Quick status": "Состояние копии", "Open game folder": "Открыть папку игры",
     "Install WidescreenFix (GitHub)": "Установить WidescreenFix (GitHub)",
     "Install ASI Loader (GitHub)": "Установить ASI Loader (GitHub)",
-    "Install WidescreenFix + ASI Loader": "Установить WidescreenFix + ASI Loader",
+    "Install WidescreenFix + ASI Loader": "Установить / обновить WidescreenFix + ASI Loader",
+    "Installing / updating WidescreenFix + ASI Loader": "Установка / обновление WidescreenFix + ASI Loader",
     "Extract RCCars.pack into game root": "Распаковать RCCars.pack в корень игры",
     "This extracts all packed files directly into the game root. After successful extraction, RCCars.pack is renamed to _RCCars.pack so the game uses loose files while the original archive stays in place.": "Все файлы будут извлечены прямо в корень игры. После распаковки RCCars.pack переименовывается в _RCCars.pack: оригинал остаётся на месте, а игра использует распакованные файлы.",
     "Game configuration": "Настройки игры", "Fog": "Туман", "Gamma changes": "Изменение гаммы",
@@ -131,7 +132,12 @@ def qss() -> str:
     QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; color: #c5cfde; }
     QProgressDialog { background: #171d27; }
     QToolTip { background: #202938; color: #f6f8fc; border: 1px solid #44536a; padding: 4px; }
-    QScrollArea { border: none; }
+    QScrollArea#PageScrollArea { border: none; }
+    QScrollBar:vertical { background: #151b24; width: 12px; margin: 2px 1px 2px 1px; border-radius: 5px; }
+    QScrollBar::handle:vertical { background: #46546b; min-height: 28px; border-radius: 5px; }
+    QScrollBar::handle:vertical:hover { background: #60738f; }
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
     """
 
 
@@ -316,8 +322,8 @@ class LauncherWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"RC Cars Launcher {APP_VERSION}")
-        self.setMinimumSize(1120, 740)
-        self.resize(1280, 820)
+        self.setMinimumSize(960, 620)
+        self.resize(1180, 780)
         self.setStyleSheet(qss())
         self.pool = QThreadPool.globalInstance()
         self._workers: set[TaskWorker] = set()
@@ -359,7 +365,9 @@ class LauncherWindow(QMainWindow):
         self._relays: set[TaskRelay] = set()
         self._build_ui()
         self._sync_active_combo()
-        self.refresh_everything()
+        # Show the window before doing filesystem scans and instance detection.
+        # The one-directory build below also avoids PyInstaller one-file extraction at startup.
+        QTimer.singleShot(120, self.refresh_startup_state)
 
     def t(self, text: str) -> str:
         if self.prefs.get("language", "en") == "ru":
@@ -474,10 +482,22 @@ class LauncherWindow(QMainWindow):
         self._build_settings_page()
         self.show_page(self.current_page_key)
 
-    def _scroll_page(self) -> tuple[QWidget, QVBoxLayout]:
-        page = QWidget()
-        outer = QVBoxLayout(page); outer.setContentsMargins(26, 24, 26, 24); outer.setSpacing(18)
-        return page, outer
+    def _scroll_page(self) -> tuple[QScrollArea, QVBoxLayout]:
+        """Create a page with a vertical scrollbar instead of compressing its contents."""
+        scroll = QScrollArea()
+        scroll.setObjectName("PageScrollArea")
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        content = QWidget()
+        content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        outer = QVBoxLayout(content)
+        outer.setContentsMargins(26, 24, 26, 24)
+        outer.setSpacing(18)
+        outer.setSizeConstraint(QLayout.SetMinimumSize)
+        scroll.setWidget(content)
+        return scroll, outer
 
     def _heading(self, layout: QVBoxLayout, title: str, subtitle: str = "") -> None:
         title_label = QLabel(self.t(title)); title_label.setObjectName("SectionTitle")
@@ -651,9 +671,18 @@ class LauncherWindow(QMainWindow):
         self.stack.addWidget(page); self.pages["Game Settings"] = page
 
     def _build_mods_page(self) -> None:
+        scroll = QScrollArea()
+        scroll.setObjectName("PageScrollArea")
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         page = ModArchiveDropPage()
+        page.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         layout = QVBoxLayout(page); layout.setContentsMargins(26, 24, 26, 24); layout.setSpacing(18)
+        layout.setSizeConstraint(QLayout.SetMinimumSize)
         page.archivesDropped.connect(self.handle_dropped_mod_archives)
+        scroll.setWidget(page)
         self._heading(layout, "Mod Manager", "Manage file-replacement mods via Ultimate ASI Loader's update/ overlay.")
         note = QLabel(self.t("The Mod Manager is available only after RCCars.pack has been extracted. Use the Home page to extract Pack first.") + "\n" + self.t("Later mods override files from earlier mods. Archives must contain game-relative paths, e.g. Textures1/file.dds.")); note.setObjectName("Muted"); note.setWordWrap(True); layout.addWidget(note)
         drop_hint = QLabel(self.t("Drag ZIP/7z archives here to add mods")); drop_hint.setObjectName("Muted"); drop_hint.setAlignment(Qt.AlignCenter); layout.addWidget(drop_hint)
@@ -675,7 +704,7 @@ class LauncherWindow(QMainWindow):
         apply_btn = QPushButton(self.t("Apply enabled mods")); apply_btn.setObjectName("Primary"); apply_btn.clicked.connect(self.apply_mods)
         box.addWidget(apply_btn, 0, Qt.AlignLeft)
         layout.addWidget(panel, 1)
-        self.stack.addWidget(page); self.pages["Mod Manager"] = page
+        self.stack.addWidget(scroll); self.pages["Mod Manager"] = scroll
 
     def _build_tools_page(self) -> None:
         page, layout = self._scroll_page()
@@ -782,6 +811,14 @@ class LauncherWindow(QMainWindow):
                 QMessageBox.warning(self, self.t("Warning"), str(exc))
                 return None
         return instance, root, backup
+
+    def refresh_startup_state(self) -> None:
+        """Refresh only visible/essential data on startup; other tabs load on demand."""
+        self._sync_active_combo()
+        self.refresh_instances_table()
+        self.refresh_home_status()
+        self.refresh_mod_access()
+        self.refresh_social_links()
 
     def refresh_everything(self) -> None:
         self._sync_active_combo()
@@ -1007,7 +1044,7 @@ class LauncherWindow(QMainWindow):
         item = self._get_required_instance()
         if not item: return
         _instance, root, backup = item
-        self.run_task(self.t("Installing WidescreenFix + ASI Loader"),
+        self.run_task(self.t("Installing / updating WidescreenFix + ASI Loader"),
                       lambda report: services.install_compatibility_components(root, backup, report),
                       lambda message: QMessageBox.information(self, self.t("Success"), message))
 
@@ -1364,7 +1401,7 @@ class LauncherWindow(QMainWindow):
             webbrowser.open(details["url"]); return
         if not getattr(sys, "frozen", False):
             webbrowser.open(details["url"])
-            QMessageBox.information(self, self.t("About"), "The launcher is running from Python source; open the release page and replace the EXE manually.")
+            QMessageBox.information(self, self.t("About"), "The launcher is running from Python source; download the portable package from the release page and replace the launcher folder manually.")
             return
         def task(report):
             staged, bat = services.prepare_self_update(details["asset_url"], details["asset_name"], report)
@@ -1391,7 +1428,9 @@ class LauncherWindow(QMainWindow):
             page_key = "Home"
         self._build_ui()
         self._sync_active_combo()
-        self.refresh_everything()
+        # Show the window before doing filesystem scans and instance detection.
+        # The one-directory build below also avoids PyInstaller one-file extraction at startup.
+        QTimer.singleShot(120, self.refresh_startup_state)
         self.show_page(page_key)
 
     def open_social_links(self) -> None:
