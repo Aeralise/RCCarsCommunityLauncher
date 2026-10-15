@@ -27,7 +27,7 @@ from .modmanager import (
     scan_mods,
 )
 
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
 
 RU = {
     "Home": "Главная", "Instances": "Копии игры", "Game Settings": "Настройки игры",
@@ -92,6 +92,9 @@ RU = {
     "Game is running": "Игра запущена", "Game process started.": "Игра запущена.", "Original files and settings backups are stored under the launcher application-data directory.": "Резервные копии файлов и настроек хранятся в каталоге данных лаунчера.",
     "Could not find a compiled WidescreenFix .asi in the latest GitHub release.": "В последнем релизе GitHub не найден скомпилированный WidescreenFix .asi.",
     "Installed": "Установлено", "Settings saved.": "Настройки сохранены.", "Files": "Файлы", "Ready": "Готово",
+    "Resolution patch failed": "Не удалось изменить разрешение",
+    "Could not update RCCars.crs before launch": "Не удалось обновить RCCars.crs перед запуском",
+    "Launch the game anyway?": "Всё равно запустить игру?",
 }
 
 
@@ -1369,10 +1372,43 @@ class LauncherWindow(QMainWindow):
     def launch_active_game(self) -> None:
         item = self._get_required_instance("launch")
         if not item: return
-        _instance, root, _backup = item
+        _instance, root, backup = item
+
+        # The startup refresh is deliberately deferred until after the window appears;
+        # ensure graphics controls have been loaded for the selected instance before
+        # using their values (but preserve edits for an already loaded instance).
+        if self._graphics_instance_id != str(_instance.get("id", "")):
+            self.load_graphics_settings()
+
+        # RCCars.crs can be rewritten by the game after it runs. Reapply the selected
+        # launcher resolution immediately before each launch so both persisted slots
+        # (menu and race) are corrected even when record ordering has changed.
+        crs_message = "RCCars.crs not present; skipped."
+        try:
+            if hasattr(self, "resolution_combo"):
+                if self.custom_resolution.isChecked():
+                    width, height = self.width_spin.value(), self.height_spin.value()
+                else:
+                    selected = self.resolution_combo.currentData()
+                    width, height = selected if selected else (self.width_spin.value(), self.height_spin.value())
+            else:
+                width, height = services.current_display_resolution()
+            crs_message = services.patch_crs_file_if_present(root, int(width), int(height), backup)
+        except Exception as exc:
+            answer = QMessageBox.question(
+                self,
+                self.t("Resolution patch failed"),
+                f"{self.t('Could not update RCCars.crs before launch')}:\n{exc}\n\n{self.t('Launch the game anyway?')}",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            crs_message = "RCCars.crs could not be patched; launched anyway."
+
         try:
             services.launch_game(root, bool(self.prefs.get("dev_mode", False)))
-            self.statusBar().showMessage(self.t("Game process started."), 5000)
+            self.statusBar().showMessage(f"{self.t('Game process started.')} {crs_message}", 8000)
         except Exception as exc:
             QMessageBox.critical(self, self.t("Error"), str(exc))
 

@@ -357,23 +357,36 @@ def _find_all(data: bytes, needle: bytes) -> list[int]:
         start = pos + 1
 
 
-def _resolution_key_positions(data: bytes, primary: bytes, alternate: bytes) -> list[int]:
-    primary_hits = _find_all(data, primary)
-    if len(primary_hits) == 2:
-        return primary_hits
-    alternate_hits = _find_all(data, alternate)
-    all_hits = sorted(set(primary_hits + alternate_hits))
-    return all_hits
+def _resolution_record_positions(data: bytes, keys: tuple[bytes, ...]) -> list[tuple[int, bytes]]:
+    """Find actual CSRC records by their length-prefixed key names, not file order."""
+    found: list[tuple[int, bytes]] = []
+    for key in keys:
+        for pos in _find_all(data, key):
+            # A standard setting starts with b"CSRC", a little-endian string length,
+            # then the NUL-terminated setting name. This filters coincidental text hits.
+            if pos < 8 or data[pos - 8:pos - 4] != b"CSRC":
+                continue
+            name_length = struct.unpack_from("<I", data, pos - 4)[0]
+            if name_length != len(key) + 1:
+                continue
+            if pos + name_length > len(data) or data[pos + len(key)] != 0:
+                continue
+            found.append((pos, key))
+    # De-duplicate and preserve physical position, since typo aliases can overlap in theory.
+    return sorted(set(found), key=lambda item: item[0])
 
 
 def patch_crs_resolutions(data: bytes, width: int, height: int) -> tuple[bytes, int, int]:
-    """Patch the two 16-bit LE resolution values following each CRS setting record.
+    """Patch both 32-bit LE resolution slots in each X/Y setting record.
 
-    Expected record signature around a value: key + variable metadata + 01 00 04 00 + u16 + ...
-    No write is returned unless there are exactly two valid records for each axis.
+    RCCars.crs stores two DWORDs for each resolution setting. In the supplied sample,
+    the VideoRace X/Y records hold separate menu and race resolutions (1280x720 and
+    1920x1080); the second X/Y pair is another persisted display-state record. Every
+    slot is set to the requested resolution so menu and race cannot retain different
+    values. Record discovery is name-based and independent of record order.
     """
-    if not (1 <= width <= 65535 and 1 <= height <= 65535):
-        raise ValueError("Resolution must fit in an unsigned 16-bit integer")
+    if not (1 <= width <= 0xFFFFFFFF and 1 <= height <= 0xFFFFFFFF):
+        raise ValueError("Resolution must fit in an unsigned 32-bit integer")
     mutable = bytearray(data)
     marker = b"\x01\x00\x04\x00"
     jobs: list[tuple[int, int, str]] = []
@@ -381,27 +394,28 @@ def patch_crs_resolutions(data: bytes, width: int, height: int) -> tuple[bytes, 
         ("X", (b"XResolution", b"XResoultion"), width),
         ("Y", (b"YResolution", b"YResoultion"), height),
     ):
-        all_key_hits: list[int] = []
-        for key in keys:
-            all_key_hits.extend(_find_all(data, key))
-        all_key_hits = sorted(set(all_key_hits))
-        # Prefer the spelling which occurs exactly twice; otherwise accept exactly two combined hits.
-        exact = next((_find_all(data, key) for key in keys if len(_find_all(data, key)) == 2), None)
-        if exact is not None:
-            all_key_hits = exact
-        if len(all_key_hits) != 2:
-            raise ValueError(f"RCCars.crs: expected 2 {label}Resolution records, found {len(all_key_hits)}. File was not modified.")
-        for key_pos in all_key_hits:
-            scan_start = key_pos + 4
-            scan_end = min(len(data), key_pos + 160)
-            record_marker = data.find(marker, scan_start, scan_end)
-            if record_marker < 0 or record_marker + 6 > len(data):
-                raise ValueError(f"RCCars.crs: could not locate the {label}Resolution value field near 0x{key_pos:X}. File was not modified.")
-            value_offset = record_marker + 4
+        hits = _resolution_record_positions(data, keys)
+        if len(hits) != 2:
+            raise ValueError(
+                f"RCCars.crs: expected 2 valid {label}Resolution records, found {len(hits)}. File was not modified."
+            )
+        for key_pos, key in hits:
+            type_pos = key_pos + len(key) + 1
+            if data[type_pos:type_pos + 4] != marker:
+                raise ValueError(
+                    f"RCCars.crs: unexpected data type for {label}Resolution near 0x{key_pos:X}. File was not modified."
+                )
+            value_offset = type_pos + 4
+            # Two 32-bit slots follow the type marker. Validate both before writing either.
+            if value_offset + 8 > len(data):
+                raise ValueError(
+                    f"RCCars.crs: incomplete {label}Resolution values near 0x{key_pos:X}. File was not modified."
+                )
             jobs.append((value_offset, value, label))
+            jobs.append((value_offset + 4, value, label))
     for offset, value, _label in jobs:
-        struct.pack_into("<H", mutable, offset, value)
-    return bytes(mutable), 2, 2
+        struct.pack_into("<I", mutable, offset, value)
+    return bytes(mutable), 4, 4
 
 
 def patch_crs_file_if_present(game_root: Path, width: int, height: int, backup_root: Path) -> str:

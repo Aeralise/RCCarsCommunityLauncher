@@ -186,14 +186,35 @@ def test_component_file_hash_detects_manual_replacement():
         assert not services._component_is_current(root, state, "asi_loader", "dinput8.dll", "abc123")
 
 
-def test_crs_patch_two_fields_each_axis():
-    def record(key: bytes, current: int) -> bytes:
-        return key + b"\x00\x00\x01\x00\x04\x00" + struct.pack("<H", current) + b"\x00\x00\x20\x03"
-    data = b"PREFIX" + record(b"XResolution", 800) + b"GAP" + record(b"XResolution", 800) + b"GAP2" + record(b"YResolution", 600) + b"GAP3" + record(b"YResolution", 600)
-    patched, x_count, y_count = patch_crs_resolutions(data, 1920, 1080)
-    assert (x_count, y_count) == (2, 2)
-    assert patched.count(struct.pack("<H", 1920)) == 2
-    assert patched.count(struct.pack("<H", 1080)) == 2
+def test_crs_patch_updates_both_32bit_slots_in_every_record():
+    def record(key: bytes, first: int, second: int) -> bytes:
+        return b"CSRC" + struct.pack("<I", len(key) + 1) + key + b"\0" + b"\x01\x00\x04\x00" + struct.pack("<II", first, second) + b"\0" * 8
+
+    # Deliberately shuffle records and begin with different menu/race values.
+    data = (
+        b"PREFIX" + record(b"YResolution", 720, 1080) + b"GAP" +
+        record(b"XResolution", 1280, 1920) + b"GAP2" +
+        record(b"XResolution", 1280, 1280) + b"GAP3" +
+        record(b"YResolution", 720, 720)
+    )
+    patched, x_count, y_count = patch_crs_resolutions(data, 2560, 1440)
+    assert (x_count, y_count) == (4, 4)
+    for axis, expected in ((b"XResolution", 2560), (b"YResolution", 1440)):
+        records = services._resolution_record_positions(patched, (axis,))
+        assert len(records) == 2
+        for pos, key in records:
+            value_offset = pos + len(key) + 1 + 4
+            assert struct.unpack_from("<II", patched, value_offset) == (expected, expected)
+
+
+def test_crs_patch_rejects_missing_or_malformed_record_without_writes():
+    data = b"CSRC" + struct.pack("<I", 12) + b"XResolution\0" + b"\x01\x00\x04\x00" + struct.pack("<II", 1280, 1920)
+    try:
+        patch_crs_resolutions(data, 1920, 1080)
+    except ValueError as exc:
+        assert "File was not modified" in str(exc)
+    else:
+        raise AssertionError("Invalid/incomplete CRS should be rejected")
 
 
 def test_config_gm_flags():

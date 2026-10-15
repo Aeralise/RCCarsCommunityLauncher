@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+- Correct `RCCars.crs` resolution handling: each CSRC resolution record contains two 32-bit little-endian values, not a single 16-bit value. Both slots in both X records and both Y records are now updated, aligning menu and race resolutions.
+- Detect `XResolution`/`YResolution` entries by validated CSRC record headers and length-prefixed key names, independent of record order; reject malformed or incomplete records without modifying the file.
+- Reapply the selected resolution immediately before launching the game because `RCCars.crs` can be regenerated/rewritten between sessions.
+- Add regression tests for shuffled record order, distinct menu/race values, and malformed/incomplete files.
+
 ## 0.1.4
 - Wrap every content page in a vertical scroll area to prevent controls/text from being compressed on smaller windows; reduce minimum window size.
 - Make WidescreenFix + ASI Loader action install missing components and check/update only changed official releases using recorded release tokens and local SHA-256 checks. Existing WidescreenFix INI settings remain untouched.
