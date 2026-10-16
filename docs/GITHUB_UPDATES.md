@@ -52,7 +52,7 @@ git push -u origin main
 ## 5. Создать первый Release с пакетом лаунчера
 
 1. Открой репозиторий на GitHub и перейди в **Releases → Draft a new release** (или **Create a new release**).
-2. Создай tag, например `v0.1.5`, укажи его для ветки `main` и задай заголовок `RC Cars Launcher 0.1.5`.
+2. Создай tag, например `v0.1.6`, укажи его для ветки `main` и задай заголовок `RC Cars Launcher 0.1.6`.
 3. Добавь release notes: ключевые изменения и известные ограничения.
 4. Перетащи **`dist\RCCarsLauncher_Portable.zip`** в область прикрепления файлов релиза. Не перепаковывай папку так, чтобы внутри ZIP появился лишний уровень вложенности; архив должен содержать `RCCarsLauncher.exe` и `_runtime\` прямо в корне. Можно дополнительно приложить `RCCarsLauncher.exe` для ручного запуска, но автообновление предпочитает ZIP-пакет.
 5. Нажми **Publish release**. Оставь release опубликованным, не Draft и не Pre-release: endpoint `releases/latest` их не рассматривает как latest stable release.
@@ -64,13 +64,13 @@ git push -u origin main
 
 При следующем обновлении:
 
-1. В `rccars_launcher/ui.py` увеличь `APP_VERSION`, например `0.1.5` → `0.1.5`.
+1. В `rccars_launcher/ui.py` увеличь `APP_VERSION` на следующую версию, например `0.1.6` → `0.1.7`.
 2. Обнови `CHANGELOG.md` и при необходимости `README.md`.
 3. Запусти тесты: `py -3 -m pytest -q`.
 4. Собери новую папку приложения на Windows и протестируй её. Скрипт создаст `RCCarsLauncher_Portable.zip` автоматически.
-5. Создай новый Release с tag `v0.1.5` и прикрепи новый `RCCarsLauncher_Portable.zip`.
+5. Создай новый Release с новым tag, например `v0.1.7`, и прикрепи новый `RCCarsLauncher_Portable.zip`.
 
-При проверке лаунчер сравнивает числа в версии тега с `APP_VERSION`. Для предсказуемого сравнения используй теги вида `vMAJOR.MINOR.PATCH`: `v0.1.5`, `v0.2.0`, `v1.0.0`.
+При проверке лаунчер сравнивает числа в версии тега с `APP_VERSION`. Для предсказуемого сравнения используй теги вида `vMAJOR.MINOR.PATCH`: `v0.1.6`, `v0.2.0`, `v1.0.0`.
 
 ## Важные детали
 

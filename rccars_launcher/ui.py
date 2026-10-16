@@ -27,7 +27,7 @@ from .modmanager import (
     scan_mods,
 )
 
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.6"
 
 RU = {
     "Home": "Главная", "Instances": "Копии игры", "Game Settings": "Настройки игры",
@@ -66,6 +66,8 @@ RU = {
     "This sets the PE Large Address Aware flag and keeps a backup of the original EXE. On 64-bit Windows, this allows a 32-bit process to use more than 2 GB of virtual address space.": "Устанавливает флаг Large Address Aware в PE-заголовке и сохраняет исходный EXE. В 64-битной Windows это позволяет 32-битному процессу использовать более 2 ГБ виртуального адресного пространства.",
     "Mods folder": "Папка модов", "Add archive(s)…": "Добавить архив(ы)…", "Remove archive": "Удалить архив",
     "Move up": "Выше", "Move down": "Ниже", "Apply enabled mods": "Применить включённые моды",
+    "Updating mod files": "Обновление файлов модов",
+    "Mod checkbox changes are applied automatically after a short pause. Use Apply enabled mods after changing mod order.": "Изменения флажков применяются автоматически после короткой паузы. После изменения порядка модов нажмите «Применить включённые моды».",
     "Open Mods folder": "Открыть папку Mods", "Enabled": "Включён", "Archive": "Архив",
     "Type": "Тип", "Order": "Порядок", "Later mods override files from earlier mods. Archives must contain game-relative paths, e.g. Textures1/file.dds.": "Поздние моды перекрывают одноимённые файлы ранних. Внутри архива должны быть пути относительно игры, например Textures1/file.dds.",
     "Add tools by copying .exe, .py, .bat, .cmd or .ps1 files into the Tools folder beside the launcher.": "Добавляйте инструменты, копируя файлы .exe, .py, .bat, .cmd или .ps1 в папку Tools рядом с лаунчером.",
@@ -366,6 +368,11 @@ class LauncherWindow(QMainWindow):
         self.mod_records: list[ModRecord] = []
         self.mod_state: dict[str, Any] = {}
         self._relays: set[TaskRelay] = set()
+        self._pending_mod_apply = None
+        self._mod_apply_timer = QTimer(self)
+        self._mod_apply_timer.setSingleShot(True)
+        self._mod_apply_timer.setInterval(550)
+        self._mod_apply_timer.timeout.connect(self._apply_pending_mod_changes)
         self._build_ui()
         self._sync_active_combo()
         # Show the window before doing filesystem scans and instance detection.
@@ -687,7 +694,7 @@ class LauncherWindow(QMainWindow):
         page.archivesDropped.connect(self.handle_dropped_mod_archives)
         scroll.setWidget(page)
         self._heading(layout, "Mod Manager", "Manage file-replacement mods via Ultimate ASI Loader's update/ overlay.")
-        note = QLabel(self.t("The Mod Manager is available only after RCCars.pack has been extracted. Use the Home page to extract Pack first.") + "\n" + self.t("Later mods override files from earlier mods. Archives must contain game-relative paths, e.g. Textures1/file.dds.")); note.setObjectName("Muted"); note.setWordWrap(True); layout.addWidget(note)
+        note = QLabel(self.t("The Mod Manager is available only after RCCars.pack has been extracted. Use the Home page to extract Pack first.") + "\n" + self.t("Later mods override files from earlier mods. Archives must contain game-relative paths, e.g. Textures1/file.dds.") + "\n" + self.t("Mod checkbox changes are applied automatically after a short pause. Use Apply enabled mods after changing mod order.")); note.setObjectName("Muted"); note.setWordWrap(True); layout.addWidget(note)
         drop_hint = QLabel(self.t("Drag ZIP/7z archives here to add mods")); drop_hint.setObjectName("Muted"); drop_hint.setAlignment(Qt.AlignCenter); layout.addWidget(drop_hint)
         panel, box = self._panel("Mods folder")
         self.mods_table = ModArchiveDropTable(0, 4)
@@ -1235,6 +1242,33 @@ class LauncherWindow(QMainWindow):
         instance = self.current_instance()
         if instance:
             self.mod_state = save_mod_settings(str(instance["id"]), self.mod_records, self.mod_state)
+            self._queue_mod_reconcile(instance)
+
+    def _queue_mod_reconcile(self, instance: dict[str, Any]) -> None:
+        """Debounce checkbox/removal changes and reconcile the update/ overlay automatically."""
+        root = Path(instance["path"]).expanduser()
+        instance_id = str(instance["id"])
+        backup = self.data_dir / "backups" / instance_id
+        backup.mkdir(parents=True, exist_ok=True)
+        # Snapshot records so a background task never observes later UI mutations.
+        records = [ModRecord(Path(m.archive), m.name, bool(m.enabled), int(m.order), m.kind)
+                   for m in self.mod_records]
+        self._pending_mod_apply = (root, instance_id, records, backup)
+        self._mod_apply_timer.start()
+
+    def _apply_pending_mod_changes(self) -> None:
+        pending = self._pending_mod_apply
+        self._pending_mod_apply = None
+        if not pending:
+            return
+        root, instance_id, records, backup = pending
+        if not root.is_dir():
+            return
+        self.run_task(
+            self.t("Updating mod files"),
+            lambda report: apply_mods(root, instance_id, records, backup, report),
+            lambda _result: self.refresh_mods_table(),
+        )
 
     def add_mod_archives(self) -> None:
         if not self._mods_available():
@@ -1274,9 +1308,13 @@ class LauncherWindow(QMainWindow):
         record = self.mod_records[row]
         if QMessageBox.question(self, self.t("Confirm"), self.t("The mod archive will be removed from the Mods folder. Continue?")) != QMessageBox.Yes:
             return
+        instance = self.current_instance()
         try:
             record.archive.unlink(missing_ok=True)
             self.refresh_mods_table()
+            # Removing an enabled archive must remove its stale files from update/ as well.
+            if instance:
+                self._queue_mod_reconcile(instance)
         except OSError as exc:
             QMessageBox.critical(self, self.t("Error"), str(exc))
 

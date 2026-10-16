@@ -1,4 +1,4 @@
-# RC Cars Launcher (prototype 0.1.5)
+# RC Cars Launcher (prototype 0.1.6)
 
 A Windows-oriented Python/Qt launcher and modding utility for **RC Cars (2003)**. This is the first functional project scaffold: source code is included; build the Windows EXE locally using the batch file.
 
@@ -12,10 +12,10 @@ A Windows-oriented Python/Qt launcher and modding utility for **RC Cars (2003)**
 - Patches `RCCars.crs` by discovering its length-prefixed `CSRC` records by setting name, regardless of record order. Each X/Y record has two 32-bit little-endian resolution slots; both slots in both records per axis are updated (four X values and four Y values total), so menu and race do not retain different resolutions. The file is checked before writing and backed up first. The selected resolution is also reapplied immediately before launching the game, since the file may be rewritten between sessions.
 - Edits `Config.gm` flags for fog, gamma, and intro playback; writes the game's `Language` registry value on Windows. Russian is written as the exact game-specific token `Русский`, while the UI continues to display `Russian`.
 - Applies the PE `IMAGE_FILE_LARGE_ADDRESS_AWARE` flag to standalone 32-bit `RCCars.exe` copies, making a backup first. Steam-managed copies and any executable with SteamStub's `.bind` section are protected from EXE modification because wrapper integrity checks may reject a modified executable; if a prior launcher backup exists, the same control can restore it.
-- ZIP and optional 7z mod archives under `<game root>\Mods`; ordered overlays are copied into `<game root>\update`. Later mods override earlier files. Original pre-existing files under `update` are backed up and restored when a managed path is no longer supplied. The Mod Manager navigation and page remain disabled until the selected instance is detected as unpacked.
+- ZIP and optional 7z mod archives under `<game root>\Mods`; ordered overlays are copied into `<game root>\update`. Later mods override earlier files. Original pre-existing files under `update` are backed up and restored when a managed path is no longer supplied. Changing a mod checkbox reconciles `update/` automatically after a short debounce; removing an archive also removes obsolete managed files. After changing mod order, use **Apply enabled mods**.
 - Runs custom `.exe`, `.py`, `.bat`, `.cmd`, and `.ps1` tools from a `Tools` folder beside the launcher. The Mod Manager UI is disabled until the selected instance is detected as unpacked. Pack detection treats a missing RCCars.pack as unpacked, and also recognizes _RCCars.pack or at least three known loose game folders; the Instances table shows the detected Pack state.
 - English/Russian launcher UI applies the selected language immediately; editable `social_links.json`; configurable GitHub-based launcher self-update scaffold.
-- Import ZIP/7z mod archives by dragging them onto the Mod Manager page or archive table.
+- Import ZIP/7z mod archives by dragging them onto the Mod Manager page or archive table. Extracted mod archives are cached under the launcher data directory by archive signature; repeat apply operations reuse cached files and skip copying files already applied from the same mod revision.
 - Detects SteamStub-wrapped executables via the `.bind` PE section and blocks LAA patching even if the Steam EXE was copied outside a Steam library.
 
 ## Build a Windows EXE
@@ -43,7 +43,7 @@ For the full step-by-step repository/release setup, see [`docs/GITHUB_UPDATES.md
 
 The combined compatibility installer checks the latest WidescreenFix GitHub Release and Ultimate ASI Loader's moving `Win32-latest` x86 asset. It records the upstream release token and installed file SHA-256 per instance: the next click checks for updates, downloads only changed components, and leaves the existing WidescreenFix INI intact. The loader is taken from `Win32-latest/dinput8-Win32.zip` because RC Cars is a 32-bit game.
 
-The launcher's self-updater needs a GitHub repository with Releases. Set `launcher_update_repo` in `launcher_config.json` to `owner/repository` and attach `RCCarsLauncher_Portable.zip` to every release (the updater prefers it over a direct EXE because this is a one-directory build). The ZIP must contain `RCCarsLauncher.exe` and `_runtime/` at its root. Update releases should use tags matching `APP_VERSION`, e.g. `v0.1.5`.
+The launcher's self-updater needs a GitHub repository with Releases. Set `launcher_update_repo` in `launcher_config.json` to `owner/repository` and attach `RCCarsLauncher_Portable.zip` to every release (the updater prefers it over a direct EXE because this is a one-directory build). The ZIP must contain `RCCarsLauncher.exe` and `_runtime/` at its root. Update releases should use tags matching `APP_VERSION`, e.g. `v0.1.6`.
 
 ## Notes / safety
 
@@ -80,4 +80,4 @@ Attach `RCCarsLauncher_Portable.zip` to the release. The archive should contain 
 
 ## Run regression tests
 
-From the project directory, run `py -3 -m pytest -q`. The current test suite covers INI line endings, Pack extraction/renaming, CRS and Config.gm patching, language mapping, LAA behavior, and mod overlays. Qt drag-and-drop and immediate UI language switching should also be smoke-tested on Windows after installing requirements.
+From the project directory, run `py -3 -m pytest -q`. The current test suite covers INI line endings, Pack extraction/renaming, CRS and Config.gm patching, language mapping, LAA behavior, mod overlay cleanup/conflicts, persistent extraction caching, and skipping copies for unchanged files. Qt drag-and-drop and immediate UI language switching should also be smoke-tested on Windows after installing requirements.

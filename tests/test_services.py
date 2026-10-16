@@ -15,6 +15,7 @@ from rccars_launcher.services import (
     game_language_registry_value, game_language_ui_value, detect_instance,
 )
 from rccars_launcher.modmanager import ModRecord, apply_mods, scan_mods
+import rccars_launcher.modmanager as modmanager
 
 
 def test_ini_preserve_comment_and_sections():
@@ -319,6 +320,91 @@ def test_mod_overlay_and_restore():
             assert not (update / "Folder/new.txt").exists()
 
 
+def test_mod_cache_skips_reextract_for_unchanged_archive():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "game"
+        root.mkdir()
+        launcher_dir = Path(td) / "launcher"
+        launcher_dir.mkdir()
+        mods_dir = root / "Mods"
+        mods_dir.mkdir()
+        archive_path = mods_dir / "Cached.zip"
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("Textures1/example.dds", b"texture data" * 1024)
+        record = ModRecord(archive=archive_path, name="Cached", enabled=True, order=0, kind="ZIP")
+        staging = launcher_dir / "staging"
+        with patch.object(services, "runtime_dir", return_value=launcher_dir):
+            with patch.object(modmanager, "_validate_extracted_tree", wraps=modmanager._validate_extracted_tree) as validate:
+                first = modmanager._extract_one(record, staging)
+                first_file = first / "Textures1" / "example.dds"
+                original_mtime = first_file.stat().st_mtime_ns
+                second = modmanager._extract_one(record, staging)
+                assert second == first
+                assert first_file.stat().st_mtime_ns == original_mtime
+                assert validate.call_count == 1, "The second call should reuse the extraction cache"
+
+
+def test_disabling_conflicting_mod_removes_its_unique_files_and_restores_winner():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "game"
+        root.mkdir()
+        launcher_dir = Path(td) / "launcher"
+        launcher_dir.mkdir()
+        mods_dir = root / "Mods"
+        mods_dir.mkdir()
+        update = root / "update"
+        update.mkdir()
+        (update / "common.txt").write_text("original common", encoding="utf-8")
+        (update / "unrelated.txt").write_text("unrelated", encoding="utf-8")
+        archive_a = mods_dir / "A.zip"
+        archive_b = mods_dir / "B.zip"
+        with zipfile.ZipFile(archive_a, "w") as archive:
+            archive.writestr("common.txt", "from A")
+            archive.writestr("only_a.txt", "A only")
+        with zipfile.ZipFile(archive_b, "w") as archive:
+            archive.writestr("common.txt", "from B")
+            archive.writestr("only_b.txt", "B only")
+        a = ModRecord(archive_a, "A", True, 0, "ZIP")
+        b = ModRecord(archive_b, "B", True, 1, "ZIP")
+        backups = Path(td) / "backups"
+        with patch.object(services, "runtime_dir", return_value=launcher_dir):
+            apply_mods(root, "test-conflicts", [a, b], backups)
+            assert (update / "common.txt").read_text(encoding="utf-8") == "from B"
+            assert (update / "only_a.txt").exists() and (update / "only_b.txt").exists()
+
+            b.enabled = False
+            apply_mods(root, "test-conflicts", [a, b], backups)
+            assert (update / "common.txt").read_text(encoding="utf-8") == "from A"
+            assert (update / "only_a.txt").read_text(encoding="utf-8") == "A only"
+            assert not (update / "only_b.txt").exists()
+            assert (update / "unrelated.txt").read_text(encoding="utf-8") == "unrelated"
+
+            a.enabled = False
+            apply_mods(root, "test-conflicts", [a, b], backups)
+            assert (update / "common.txt").read_text(encoding="utf-8") == "original common"
+            assert not (update / "only_a.txt").exists()
+            assert (update / "unrelated.txt").read_text(encoding="utf-8") == "unrelated"
+
+
+def test_reapply_unchanged_mod_skips_copying_files():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "game"
+        root.mkdir()
+        launcher_dir = Path(td) / "launcher"
+        launcher_dir.mkdir()
+        mods_dir = root / "Mods"
+        mods_dir.mkdir()
+        archive_path = mods_dir / "FastApply.zip"
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("Settings/sample.cfg", "config" * 100)
+        record = ModRecord(archive_path, "FastApply", True, 0, "ZIP")
+        with patch.object(services, "runtime_dir", return_value=launcher_dir):
+            apply_mods(root, "test-fast", [record], Path(td) / "backups")
+            with patch.object(modmanager.shutil, "copy2", side_effect=AssertionError("unchanged file should not be recopied")):
+                apply_mods(root, "test-fast", [record], Path(td) / "backups")
+
+
+
 if __name__ == "__main__":
     test_ini_preserve_comment_and_sections()
     test_language_registry_russian_mapping()
@@ -341,9 +427,9 @@ if __name__ == "__main__":
 
 def test_launcher_update_prefers_portable_runtime_zip_over_exe():
     release = {
-        "tag_name": "v0.1.5",
-        "name": "RC Cars Launcher 0.1.5",
-        "html_url": "https://github.com/example/RCCarsLauncher/releases/tag/v0.1.5",
+        "tag_name": "v0.1.6",
+        "name": "RC Cars Launcher 0.1.6",
+        "html_url": "https://github.com/example/RCCarsLauncher/releases/tag/v0.1.6",
         "assets": [
             {"name": "RCCarsLauncher.exe", "browser_download_url": "https://example/launcher.exe", "size": 1000},
             {"name": "RCCarsLauncher_Portable.zip", "browser_download_url": "https://example/launcher.zip", "size": 5000},

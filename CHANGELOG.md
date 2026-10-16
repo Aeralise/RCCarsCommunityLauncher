@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6
+- Fix: disabling a mod now automatically reconciles the game `update/` overlay after a short debounce, removing files no longer provided by any enabled mod and restoring original files where applicable.
+- Fix: deleting a mod archive also reconciles the overlay so orphaned mod files do not remain active.
+- Performance: extracted ZIP/7z contents are cached per instance and archive revision; unchanged archives are not decompressed on each apply.
+- Performance: ZIP members are streamed to disk rather than loaded fully into memory, and unchanged destination files are not copied again.
+- Conflict handling: if a disabled higher-priority mod supplied a shared path, the next enabled mod's version becomes active instead of deleting the shared file.
+- Added regression tests for disabled-mod cleanup, conflict winner fallback, persistent extraction caching, and no-op reapplication.
+
 ## 0.1.5
 - Correct `RCCars.crs` resolution handling: each CSRC resolution record contains two 32-bit little-endian values, not a single 16-bit value. Both slots in both X records and both Y records are now updated, aligning menu and race resolutions.
 - Detect `XResolution`/`YResolution` entries by validated CSRC record headers and length-prefixed key names, independent of record order; reject malformed or incomplete records without modifying the file.
