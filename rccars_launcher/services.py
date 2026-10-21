@@ -26,6 +26,12 @@ APP_NAME = "RC Cars Launcher"
 STEAM_APP_ID = "289460"  # RC Cars (2003), Steam
 WSF_REPO = "Aeralise/RCCars_WidescreenFix"
 ASI_LOADER_REPO = "ThirteenAG/Ultimate-ASI-Loader"
+DGVOODOO_REPO = "dege-diosg/dgVoodoo2"
+# SHA-256 of the clean standalone executable supplied by the user and the clean
+# SteamStub-wrapped executable supplied earlier for comparison. These are hashes only;
+# the game binaries are deliberately not redistributed with the launcher.
+CLEAN_STANDALONE_EXE_SHA256 = "381ec57fdea7be88a9805f1562c62d7694223ce6be7699864ad743dcb88b45f1"
+CLEAN_STEAM_EXE_SHA256 = "748520161b80b80a5e97335917f1404777f03c6680d6f14acca0980afd4550f8"
 ASI_LOADER_DOWNLOAD = "https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases/download/Win32-latest/dinput8-Win32.zip"
 CONFIG_KEYS = {
     "VIDEO_UseFog": "fog",
@@ -151,6 +157,37 @@ def is_steam_stub_wrapped(path: Path) -> bool:
         return False
 
 
+def validate_game_executable(path: Path) -> dict[str, Any]:
+    """Compare a game executable with the two clean samples provided for this project.
+
+    Returns a report instead of blocking registration: unknown or patched EXEs may still
+    be legitimate user copies, but they should be called out before future patching.
+    """
+    digest = _sha256_file(path)
+    steam_stub = is_steam_stub_wrapped(path)
+    if digest == CLEAN_STANDALONE_EXE_SHA256:
+        status = "clean_standalone"
+        matches = True
+        description = "Exact match for the supplied clean standalone RCCars.exe sample."
+    elif digest == CLEAN_STEAM_EXE_SHA256:
+        status = "clean_steam"
+        matches = True
+        description = "Exact match for the supplied clean SteamStub-wrapped RCCars.exe sample."
+    elif steam_stub:
+        status = "modified_steam"
+        matches = False
+        description = "SteamStub (.bind) executable detected, but its SHA-256 differs from the clean Steam sample."
+    else:
+        status = "modified_standalone"
+        matches = False
+        description = "Executable SHA-256 differs from the clean standalone sample. It may already be patched or be another build."
+    return {
+        "path": str(path), "sha256": digest, "steam_stub_wrapped": steam_stub,
+        "status": status, "matches_reference": matches, "description": description,
+        "reference_sha256": CLEAN_STEAM_EXE_SHA256 if steam_stub else CLEAN_STANDALONE_EXE_SHA256,
+    }
+
+
 def detect_instance(game_root: Path) -> dict[str, Any]:
     root = game_root.expanduser().resolve()
     exe = root / "RCCars.exe"
@@ -201,6 +238,7 @@ def detect_instance(game_root: Path) -> dict[str, Any]:
         "widescreen_files": [str(p) for p in wsf_files],
         "asi_loader": loader.is_file(),
         "asi_loader_file": str(loader) if loader.is_file() else "",
+        "dgvoodoo": (root / "dgVoodooCpl.exe").is_file() and (root / "dgVoodoo.conf").is_file() and (root / "d3d8.dll").is_file(),
         "crs_file": crs.is_file(),
         "ini_file": ini.is_file(),
         "large_address_aware": is_large_address_aware(exe) if exe.is_file() else False,
@@ -418,14 +456,82 @@ def patch_crs_resolutions(data: bytes, width: int, height: int) -> tuple[bytes, 
     return bytes(mutable), 4, 4
 
 
-def patch_crs_file_if_present(game_root: Path, width: int, height: int, backup_root: Path) -> str:
+def _crs_window_flag_record_positions(data: bytes, key: bytes) -> list[int]:
+    """Locate a serialized CRS boolean-like flag stored in the first byte of DWORD #2."""
+    found: list[int] = []
+    marker = b"\x01\x00\x04\x00"
+    for pos in _find_all(data, key):
+        if pos < 8 or data[pos - 8:pos - 4] != b"CSRC":
+            continue
+        if struct.unpack_from("<I", data, pos - 4)[0] != len(key) + 1:
+            continue
+        if pos + len(key) >= len(data) or data[pos + len(key)] != 0:
+            continue
+        type_pos = pos + len(key) + 1
+        if data[type_pos:type_pos + 4] != marker:
+            continue
+        # The value is at key + NUL + 4-byte type marker + first DWORD (4 bytes).
+        value_pos = type_pos + 8
+        if value_pos < len(data):
+            found.append(value_pos)
+    return sorted(set(found))
+
+
+def _window_mode_record_positions(data: bytes) -> list[int]:
+    """Compatibility wrapper for code/tests that specifically refer to WindowMode."""
+    return _crs_window_flag_record_positions(data, b"WindowMode")
+
+
+def read_crs_windowed(data: bytes) -> Optional[bool]:
+    """Read WindowMode; None means its record is absent or malformed."""
+    positions = _window_mode_record_positions(data)
+    if len(positions) != 1:
+        return None
+    value = data[positions[0]]
+    return bool(value) if value in (0, 1) else None
+
+
+def patch_crs_window_mode(data: bytes, windowed: bool) -> tuple[bytes, int]:
+    """Patch WindowMode and VIDEO_RunInWindow when present, independent of record order.
+
+    WindowMode is required. VIDEO_RunInWindow was introduced/serialized separately by
+    some game builds, so update it when present but remain compatible with files lacking it.
+    """
+    window_positions = _window_mode_record_positions(data)
+    video_positions = _crs_window_flag_record_positions(data, b"VIDEO_RunInWindow")
+    if len(window_positions) != 1 or len(video_positions) > 1:
+        raise ValueError(
+            "RCCars.crs: expected exactly one WindowMode record and at most one "
+            f"VIDEO_RunInWindow record; found {len(window_positions)} and {len(video_positions)}. "
+            "File was not modified."
+        )
+    positions = window_positions + video_positions
+    for pos in positions:
+        if data[pos] not in (0, 1):
+            raise ValueError(
+                f"RCCars.crs: invalid window-mode value at 0x{pos:X}. File was not modified."
+            )
+    mutable = bytearray(data)
+    for pos in positions:
+        mutable[pos] = 1 if windowed else 0
+    return bytes(mutable), len(positions)
+
+
+def patch_crs_file_if_present(game_root: Path, width: int, height: int, backup_root: Path,
+                              windowed: Optional[bool] = None) -> str:
     path = game_root / "RCCars.crs"
     if not path.is_file():
         return "RCCars.crs not present; skipped."
+    original = path.read_bytes()
+    # Validate every requested patch before writing, so a malformed file is never partially changed.
+    patched, xc, yc = patch_crs_resolutions(original, width, height)
+    window_count = 0
+    if windowed is not None:
+        patched, window_count = patch_crs_window_mode(patched, windowed)
     backup_file_once(game_root, path, backup_root)
-    patched, xc, yc = patch_crs_resolutions(path.read_bytes(), width, height)
     path.write_bytes(patched)
-    return f"Patched RCCars.crs: {xc} X-resolution values and {yc} Y-resolution values."
+    extra = f" WindowMode/VIDEO_RunInWindow={int(windowed)} ({window_count} record(s))." if windowed is not None else ""
+    return f"Patched RCCars.crs: {xc} X-resolution values and {yc} Y-resolution values.{extra}"
 
 
 def patch_config_gm(game_root: Path, values: dict[str, bool], backup_root: Path) -> str:
@@ -753,6 +859,244 @@ def install_widescreen_fix(game_root: Path, backup_root: Path,
     if progress:
         progress(100, f"Installed release {release.get('tag_name', 'latest')}")
     return f"Installed RC Cars WidescreenFix {release.get('tag_name', 'latest')}: {', '.join(installed) or 'plugin refreshed; existing INI preserved'}."
+
+
+def _conf_update_key(text: str, section: str, key: str, value: str) -> str:
+    """Replace/add an INI-like key in a specific section without normalizing the whole file."""
+    lines = text.splitlines()
+    section_re = re.compile(r"^\s*\[\s*([^\]]+)\s*\]\s*$", re.I)
+    key_re = re.compile(r"^(\s*" + re.escape(key) + r"\s*=\s*).*$", re.I)
+    start = None
+    end = len(lines)
+    for idx, line in enumerate(lines):
+        m = section_re.match(line)
+        if not m:
+            continue
+        if start is not None:
+            end = idx
+            break
+        if m.group(1).strip().casefold() == section.casefold():
+            start = idx
+    if start is not None:
+        for idx in range(start + 1, end):
+            match = key_re.match(lines[idx])
+            if match:
+                comment = ""
+                value_text = lines[idx]
+                for marker in (";", "#"):
+                    pos = value_text.find(marker)
+                    if pos >= 0:
+                        comment = value_text[pos:]
+                        value_text = value_text[:pos]
+                        break
+                prefix_match = re.match(r"^(\s*" + re.escape(key) + r"\s*=\s*).*$", value_text, re.I)
+                prefix = prefix_match.group(1) if prefix_match else f"{key} = "
+                lines[idx] = prefix + value + ((" " if comment and not comment.startswith(" ") else "") + comment if comment else "")
+                break
+        else:
+            lines.insert(end, f"{key} = {value}")
+    else:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend([f"[{section}]", f"{key} = {value}"])
+    return "\r\n".join(lines).rstrip("\r\n") + "\r\n"
+
+
+def patch_dgvoodoo_conf(path: Path, resolution: tuple[int, int, int], depth_mode: str,
+                        disable_and_passthru: bool, backup_root: Optional[Path] = None,
+                        game_root: Optional[Path] = None, filtering: str = "bilinear",
+                        antialiasing: str = "appdriven") -> Path:
+    """Write launcher-controlled dgVoodoo keys while preserving other settings."""
+    valid_depth_modes = {"appdriven", "forcemin24bit", "force32bit"}
+    valid_filtering = {"appdriven", "pointsampled", "bilinear", "pointmip", "linearmip", "trilinear", "2", "4", "8", "16"}
+    valid_antialiasing = {"appdriven", "off", "2x", "4x", "8x"}
+    if depth_mode not in valid_depth_modes:
+        raise ValueError(f"Invalid DepthBuffersBitDepth value: {depth_mode}")
+    filtering = str(filtering).strip().casefold()
+    antialiasing = str(antialiasing).strip().casefold()
+    if filtering not in valid_filtering:
+        raise ValueError(f"Invalid DirectX Filtering value: {filtering}")
+    if antialiasing not in valid_antialiasing:
+        raise ValueError(f"Invalid DirectX Antialiasing value: {antialiasing}")
+    width, height, refresh = (int(resolution[0]), int(resolution[1]), int(resolution[2]))
+    if width < 1 or height < 1 or refresh < 1:
+        raise ValueError("dgVoodoo resolution and refresh rate must be positive")
+    if path.exists():
+        raw = path.read_bytes()
+        if backup_root is not None and game_root is not None:
+            backup_file_once(game_root, path, backup_root)
+        if raw.startswith(b"\xef\xbb\xbf"):
+            text, encoding = raw.decode("utf-8-sig", errors="replace"), "utf-8-sig"
+        else:
+            try:
+                text, encoding = raw.decode("utf-8"), "utf-8"
+            except UnicodeDecodeError:
+                text, encoding = raw.decode("cp1252", errors="replace"), "cp1252"
+        # Preserve an existing CRLF/CR/LF convention before normalized output.
+        newline = "\r\n" if b"\r\n" in raw else ("\r" if b"\r" in raw and b"\n" not in raw else "\n")
+    else:
+        text, encoding, newline = "", "utf-8", "\r\n"
+    values = [
+        ("General", "EnumerateRefreshRates", "true"),
+        ("DirectX", "Resolution", f"h:{width}, v:{height}, refrate:{refresh}"),
+        ("DirectX", "DisableAndPassThru", "true" if disable_and_passthru else "false"),
+        ("DirectX", "Filtering", filtering),
+        ("DirectX", "Antialiasing", antialiasing),
+        ("DirectXExt", "DepthBuffersBitDepth", depth_mode),
+        ("DirectX", "dgVoodooWatermark", "false"),
+    ]
+    for section, key, value in values:
+        text = _conf_update_key(text, section, key, value)
+    # _conf_update_key is deterministic CRLF; re-apply the source newline convention.
+    if newline != "\r\n":
+        text = text.replace("\r\n", "\n").replace("\n", newline)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode(encoding))
+    return path
+
+
+def read_dgvoodoo_settings(path: Path) -> dict[str, Any]:
+    """Read the small subset of dgVoodoo settings exposed by the launcher."""
+    result: dict[str, Any] = {
+        "resolution": None,
+        "depth_mode": "appdriven",
+        "disable_and_passthru": False,
+        "filtering": "bilinear",
+        "antialiasing": "appdriven",
+        "enumerate_refresh_rates": True,
+    }
+    if not path.is_file():
+        return result
+    resolution = read_ini_value(path, "DirectX", "Resolution", "")
+    match = re.search(r"h\s*:\s*(\d+)\s*,\s*v\s*:\s*(\d+)(?:\s*,\s*refrate\s*:\s*(\d+))?", resolution, re.I)
+    if match:
+        result["resolution"] = (int(match.group(1)), int(match.group(2)), int(match.group(3) or 60))
+    result["depth_mode"] = read_ini_value(path, "DirectXExt", "DepthBuffersBitDepth", "appdriven").strip().casefold()
+    if result["depth_mode"] not in {"appdriven", "forcemin24bit", "force32bit"}:
+        result["depth_mode"] = "appdriven"
+    result["disable_and_passthru"] = read_ini_value(path, "DirectX", "DisableAndPassThru", "false").strip().casefold() in {"true", "1", "yes"}
+    result["filtering"] = read_ini_value(path, "DirectX", "Filtering", "bilinear").strip().casefold()
+    if result["filtering"] not in {"appdriven", "pointsampled", "bilinear", "pointmip", "linearmip", "trilinear", "2", "4", "8", "16"}:
+        result["filtering"] = "bilinear"
+    result["antialiasing"] = read_ini_value(path, "DirectX", "Antialiasing", "appdriven").strip().casefold()
+    if result["antialiasing"] not in {"appdriven", "off", "2x", "4x", "8x"}:
+        result["antialiasing"] = "appdriven"
+    result["enumerate_refresh_rates"] = read_ini_value(path, "General", "EnumerateRefreshRates", "true").strip().casefold() in {"true", "1", "yes"}
+    return result
+
+
+def _dgvoodoo_release_asset(release: dict[str, Any]) -> dict[str, Any]:
+    assets = release.get("assets", [])
+    zips = [a for a in assets if str(a.get("name", "")).lower().endswith(".zip")]
+    preferred = [a for a in zips if re.fullmatch(r"dgvoodoo2_\d+_\d+\.zip", str(a.get("name", "")), re.I)]
+    if not preferred:
+        preferred = [a for a in zips if "dgvoodoo" in str(a.get("name", "")).lower()
+                     and not any(word in str(a.get("name", "")).lower() for word in ("api", "dev", "source", "symbols"))]
+    if not preferred:
+        raise RuntimeError(f"Latest dgVoodoo release {release.get('tag_name', '?')} has no full distribution ZIP")
+    # Release assets normally contain a single full package; prefer one whose name suffix matches the tag.
+    tag_digits = re.sub(r"\D", "", str(release.get("tag_name", "")))
+    matching = [a for a in preferred if re.sub(r"\D", "", str(a.get("name", ""))).endswith(tag_digits)] if tag_digits else []
+    return matching[0] if matching else preferred[0]
+
+
+def install_or_update_dgvoodoo(game_root: Path, backup_root: Path,
+                               progress: Optional[Callable[[int, str], None]] = None) -> str:
+    """Install/update only dgVoodoo's 32-bit D3D8 wrapper, control panel, and conf."""
+    if progress:
+        progress(1, "Checking the official dgVoodoo GitHub release…")
+    release = github_json(f"https://api.github.com/repos/{DGVOODOO_REPO}/releases/latest")
+    version = str(release.get("tag_name") or release.get("published_at") or "latest")
+    state = _read_component_state(backup_root)
+    cpl_current = _component_is_current(game_root, state, "dgvoodoo_cpl", "dgVoodooCpl.exe", version)
+    dll_current = _component_is_current(game_root, state, "dgvoodoo_d3d8", "d3d8.dll", version)
+    conf_path = game_root / "dgVoodoo.conf"
+    if cpl_current and dll_current and conf_path.is_file():
+        settings = read_dgvoodoo_settings(conf_path)
+        current_res = settings["resolution"] or (current_display_resolution()[0], current_display_resolution()[1], current_display_refresh_rate())
+        patch_dgvoodoo_conf(conf_path, current_res, settings["depth_mode"], settings["disable_and_passthru"], backup_root, game_root, settings["filtering"], settings["antialiasing"])
+        if progress:
+            progress(100, f"dgVoodoo {version} is already current")
+        return f"dgVoodoo {version} is already installed and up to date."
+
+    asset = _dgvoodoo_release_asset(release)
+    blob = download_bytes(str(asset["browser_download_url"]), progress, f"Downloading {asset.get('name', 'dgVoodoo')}")
+    from io import BytesIO
+    try:
+        with zipfile.ZipFile(BytesIO(blob)) as archive:
+            members = archive.infolist()
+            def by_basename(name: str) -> list[zipfile.ZipInfo]:
+                return [m for m in members if not m.is_dir() and Path(m.filename.replace("\\", "/")).name.casefold() == name.casefold()]
+            cpl_members = by_basename("dgVoodooCpl.exe")
+            conf_members = by_basename("dgVoodoo.conf")
+            dll_members = [m for m in members if not m.is_dir()
+                           and Path(m.filename.replace("\\", "/")).name.casefold() == "d3d8.dll"
+                           and any(part.casefold() == "x86" for part in PurePosixPath(m.filename.replace("\\", "/")).parts)
+                           and any(part.casefold() == "ms" for part in PurePosixPath(m.filename.replace("\\", "/")).parts)]
+            if not cpl_members:
+                raise RuntimeError("The official dgVoodoo package does not contain dgVoodooCpl.exe")
+            if not conf_members:
+                raise RuntimeError("The official dgVoodoo package does not contain dgVoodoo.conf")
+            if not dll_members:
+                raise RuntimeError("The official dgVoodoo package does not contain the 32-bit MS/x86/D3D8.dll")
+            payloads = {
+                "dgVoodooCpl.exe": archive.read(cpl_members[0]),
+                "d3d8.dll": archive.read(dll_members[0]),
+                "dgVoodoo.conf": archive.read(conf_members[0]),
+            }
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError("The official dgVoodoo download is not a valid ZIP archive") from exc
+    for name, payload in payloads.items():
+        if name.lower().endswith((".exe", ".dll")) and not payload.startswith(b"MZ"):
+            raise RuntimeError(f"The downloaded {name} does not have a valid PE header")
+    for name in ("dgVoodooCpl.exe", "d3d8.dll"):
+        if not _component_is_current(game_root, state, f"dgvoodoo_{'cpl' if name == 'dgVoodooCpl.exe' else 'd3d8'}", name, version):
+            _install_file(game_root, name, payloads[name], backup_root)
+    config_was_missing = not conf_path.is_file()
+    if config_was_missing:
+        conf_path.write_bytes(payloads["dgVoodoo.conf"])
+    settings = read_dgvoodoo_settings(conf_path)
+    if config_was_missing:
+        # The downloaded stock config often says appdriven; launcher default is bilinear.
+        settings["filtering"] = "bilinear"
+        settings["antialiasing"] = "appdriven"
+        pending = read_json(backup_root / "dgvoodoo_settings.json", {})
+        try:
+            pending_resolution = tuple(int(v) for v in pending.get("resolution", []))
+            if len(pending_resolution) == 3:
+                settings["resolution"] = pending_resolution
+            settings["depth_mode"] = str(pending.get("depth_mode", settings["depth_mode"]))
+            settings["disable_and_passthru"] = bool(pending.get("disable_and_passthru", settings["disable_and_passthru"]))
+            if "filtering" in pending:
+                settings["filtering"] = str(pending["filtering"])
+            if "antialiasing" in pending:
+                settings["antialiasing"] = str(pending["antialiasing"])
+        except (TypeError, ValueError):
+            pass
+    current_res = settings["resolution"] or (current_display_resolution()[0], current_display_resolution()[1], current_display_refresh_rate())
+    patch_dgvoodoo_conf(conf_path, current_res, settings["depth_mode"], settings["disable_and_passthru"], backup_root, game_root, settings["filtering"], settings["antialiasing"])
+    write_json(backup_root / "dgvoodoo_settings.json", {
+        "resolution": [int(current_res[0]), int(current_res[1]), int(current_res[2])],
+        "depth_mode": settings["depth_mode"],
+        "disable_and_passthru": bool(settings["disable_and_passthru"]),
+        "filtering": settings["filtering"],
+        "antialiasing": settings["antialiasing"],
+    })
+    # Clean up the incorrectly renamed control panel created by older launcher builds,
+    # but only when the stored hash proves that this file was installed by that build.
+    legacy_cpl = game_root / "dgVoodoo.exe"
+    old_cpl_record = state.get("components", {}).get("dgvoodoo_cpl", {})
+    if (legacy_cpl.is_file()
+            and str(old_cpl_record.get("filename", "")) == "dgVoodoo.exe"
+            and _sha256_file(legacy_cpl) == str(old_cpl_record.get("sha256", ""))):
+        backup_file_once(game_root, legacy_cpl, backup_root)
+        legacy_cpl.unlink()
+    _record_component(game_root, state, "dgvoodoo_cpl", "dgVoodooCpl.exe", version)
+    _record_component(game_root, state, "dgvoodoo_d3d8", "d3d8.dll", version)
+    write_json(_component_state_path(backup_root), state)
+    if progress:
+        progress(100, f"dgVoodoo {version} installed")
+    return f"Installed/updated dgVoodoo {version}: dgVoodooCpl.exe, dgVoodoo.conf, d3d8.dll (x86). Watermark disabled; refresh rates enabled; Filtering/Antialiasing configured."
 
 
 def _sha256_file(path: Path) -> str:
@@ -1090,6 +1434,85 @@ def available_resolutions() -> list[tuple[int, int]]:
                    (1920, 1200), (2560, 1080), (2560, 1440), (3440, 1440), (3840, 2160)})
     # Put common/resolutions-increasing order; the UI selects the current desktop first.
     return sorted(values, key=lambda wh: (wh[0] * wh[1], wh[0]))
+
+
+def current_display_refresh_rate() -> int:
+    """Return current Windows desktop refresh rate, with a portable fallback."""
+    if os.name == "nt":
+        try:
+            from ctypes import wintypes
+            class DEVMODEW(ctypes.Structure):
+                _fields_ = [
+                    ("dmDeviceName", ctypes.c_wchar * 32), ("dmSpecVersion", wintypes.WORD),
+                    ("dmDriverVersion", wintypes.WORD), ("dmSize", wintypes.WORD),
+                    ("dmDriverExtra", wintypes.WORD), ("dmFields", wintypes.DWORD),
+                    ("dmPositionX", wintypes.LONG), ("dmPositionY", wintypes.LONG),
+                    ("dmDisplayOrientation", wintypes.DWORD), ("dmDisplayFixedOutput", wintypes.DWORD),
+                    ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short), ("dmYResolution", ctypes.c_short),
+                    ("dmTTOption", ctypes.c_short), ("dmCollate", ctypes.c_short),
+                    ("dmFormName", ctypes.c_wchar * 32), ("dmLogPixels", wintypes.WORD),
+                    ("dmBitsPerPel", wintypes.DWORD), ("dmPelsWidth", wintypes.DWORD),
+                    ("dmPelsHeight", wintypes.DWORD), ("dmDisplayFlags", wintypes.DWORD),
+                    ("dmDisplayFrequency", wintypes.DWORD), ("dmICMMethod", wintypes.DWORD),
+                    ("dmICMIntent", wintypes.DWORD), ("dmMediaType", wintypes.DWORD),
+                    ("dmDitherType", wintypes.DWORD), ("dmReserved1", wintypes.DWORD),
+                    ("dmReserved2", wintypes.DWORD), ("dmPanningWidth", wintypes.DWORD),
+                    ("dmPanningHeight", wintypes.DWORD),
+                ]
+            mode = DEVMODEW()
+            mode.dmSize = ctypes.sizeof(DEVMODEW)
+            if ctypes.windll.user32.EnumDisplaySettingsW(None, -1, ctypes.byref(mode)):
+                frequency = int(mode.dmDisplayFrequency)
+                if 1 <= frequency <= 1000:
+                    return frequency
+        except Exception:
+            pass
+    return 60
+
+
+def available_display_modes() -> list[tuple[int, int, int]]:
+    """Enumerate available Windows width/height/refresh modes for dgVoodoo."""
+    modes: set[tuple[int, int, int]] = set()
+    if os.name == "nt":
+        try:
+            from ctypes import wintypes
+            class DEVMODEW(ctypes.Structure):
+                _fields_ = [
+                    ("dmDeviceName", ctypes.c_wchar * 32), ("dmSpecVersion", wintypes.WORD),
+                    ("dmDriverVersion", wintypes.WORD), ("dmSize", wintypes.WORD),
+                    ("dmDriverExtra", wintypes.WORD), ("dmFields", wintypes.DWORD),
+                    ("dmPositionX", wintypes.LONG), ("dmPositionY", wintypes.LONG),
+                    ("dmDisplayOrientation", wintypes.DWORD), ("dmDisplayFixedOutput", wintypes.DWORD),
+                    ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short), ("dmYResolution", ctypes.c_short),
+                    ("dmTTOption", ctypes.c_short), ("dmCollate", ctypes.c_short),
+                    ("dmFormName", ctypes.c_wchar * 32), ("dmLogPixels", wintypes.WORD),
+                    ("dmBitsPerPel", wintypes.DWORD), ("dmPelsWidth", wintypes.DWORD),
+                    ("dmPelsHeight", wintypes.DWORD), ("dmDisplayFlags", wintypes.DWORD),
+                    ("dmDisplayFrequency", wintypes.DWORD), ("dmICMMethod", wintypes.DWORD),
+                    ("dmICMIntent", wintypes.DWORD), ("dmMediaType", wintypes.DWORD),
+                    ("dmDitherType", wintypes.DWORD), ("dmReserved1", wintypes.DWORD),
+                    ("dmReserved2", wintypes.DWORD), ("dmPanningWidth", wintypes.DWORD),
+                    ("dmPanningHeight", wintypes.DWORD),
+                ]
+            index = 0
+            while index < 1024:
+                mode = DEVMODEW()
+                mode.dmSize = ctypes.sizeof(DEVMODEW)
+                if not ctypes.windll.user32.EnumDisplaySettingsW(None, index, ctypes.byref(mode)):
+                    break
+                width, height, refresh = int(mode.dmPelsWidth), int(mode.dmPelsHeight), int(mode.dmDisplayFrequency)
+                if width >= 640 and height >= 480 and 1 <= refresh <= 1000:
+                    modes.add((width, height, refresh))
+                index += 1
+        except Exception:
+            pass
+    current_w, current_h = current_display_resolution()
+    current_hz = current_display_refresh_rate()
+    modes.add((current_w, current_h, current_hz))
+    # Common fallback modes make the picker useful in automated tests and non-Windows dev runs.
+    for width, height in available_resolutions():
+        modes.add((width, height, current_hz))
+    return sorted(modes, key=lambda item: (item[0] * item[1], item[0], item[2]))
 
 
 def current_display_resolution() -> tuple[int, int]:

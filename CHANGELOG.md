@@ -1,4 +1,25 @@
+## 0.1.9
+
+- Move the "Apply all game settings" action to the top of the scrollable Game Settings page, beside its explanatory note, so it remains easy to reach without scrolling to the bottom.
+
+## 0.1.8
+
+- Force `[General] EnumerateRefreshRates = true` alongside disabling the dgVoodoo watermark.
+- Add DirectX Filtering controls (`appdriven`, `pointsampled`, `bilinear`, `pointmip`, `linearmip`, `trilinear`, and anisotropic levels 2/4/8/16), defaulting to `bilinear`.
+- Add DirectX MSAA antialiasing controls (`appdriven`, `off`, `2x`, `4x`, `8x`).
+- Keep the official control-panel filename `dgVoodooCpl.exe` instead of renaming it. Safely remove the legacy `dgVoodoo.exe` only when the component manifest confirms ownership by the older launcher.
+- Apply the window-mode selection to both `WindowMode` and `VIDEO_RunInWindow` records in `RCCars.crs`, when present.
+
 # Changelog
+
+## 0.1.7
+- Add a persistent "Close launcher after launch" checkbox below the Run Game button; the launcher closes only after the game process starts successfully.
+- Add official dgVoodoo2 install/update from GitHub Releases, installing only the control panel (`dgVoodoo.exe`), `dgVoodoo.conf`, and the 32-bit `MS/x86/D3D8.dll` as `d3d8.dll`. `dgVoodooWatermark` is forced off.
+- Add dgVoodoo resolution/refresh-rate, `DepthBuffersBitDepth`, and `DisableAndPassThru` settings to the Game Settings page; settings are retained per instance before installation.
+- Add the `RCCars.crs` WindowMode checkbox. The named record is located independent of record order and its mode byte is updated together with both menu/race resolution values.
+- Validate newly added game executables by SHA-256 against supplied clean standalone/Steam reference samples; warn on mismatches and preserve the encountered EXE as a per-instance baseline backup.
+- Unify graphic/game-configuration save buttons into one "Apply all game settings" action.
+- Add regression tests for dgVoodoo release extraction/config updates, `WindowMode` patching, and executable validation.
 
 ## 0.1.6
 - Fix: disabling a mod now automatically reconciles the game `update/` overlay after a short debounce, removing files no longer provided by any enabled mod and restoring original files where applicable.

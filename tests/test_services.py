@@ -467,3 +467,180 @@ def test_prepare_self_update_extracts_only_exe_and_runtime_from_portable_zip():
         script = cmd.read_text(encoding="utf-8")
         assert "_runtime.old" in script
         assert "RCCarsLauncher.exe" in script
+
+
+def test_crs_window_mode_is_found_by_name_and_patched_at_documented_byte():
+    def record(key: bytes, first: int, second: int) -> bytes:
+        return b"CSRC" + struct.pack("<I", len(key) + 1) + key + b"\0" + b"\x01\x00\x04\x00" + struct.pack("<II", first, second) + b"\0" * 8
+
+    data = b"PREFIX" + record(b"XResolution", 1280, 1920) + record(b"WindowMode", 0, 1)
+    assert services.read_crs_windowed(data) is True
+    patched, count = services.patch_crs_window_mode(data, False)
+    assert count == 1
+    assert services.read_crs_windowed(patched) is False
+    mode_pos = services._window_mode_record_positions(patched)
+    assert len(mode_pos) == 1 and patched[mode_pos[0]] == 0
+    patched2, _ = services.patch_crs_window_mode(patched, True)
+    assert services.read_crs_windowed(patched2) is True
+
+
+def test_crs_window_mode_updates_both_WindowMode_and_VIDEO_RunInWindow():
+    def record(key: bytes, first: int, second: int) -> bytes:
+        return (b"CSRC" + struct.pack("<I", len(key) + 1) + key + b"\0" +
+                b"\x01\x00\x04\x00" + struct.pack("<II", first, second) + b"\0" * 8)
+
+    # Deliberately put VIDEO_RunInWindow first to prove discovery is name-based.
+    data = b"PREFIX" + record(b"VIDEO_RunInWindow", 0, 0) + record(b"OtherFlag", 0, 0) + record(b"WindowMode", 0, 1)
+    patched, count = services.patch_crs_window_mode(data, False)
+    assert count == 2
+    video_pos = services._crs_window_flag_record_positions(patched, b"VIDEO_RunInWindow")
+    window_pos = services._window_mode_record_positions(patched)
+    assert len(video_pos) == len(window_pos) == 1
+    assert patched[video_pos[0]] == 0
+    assert patched[window_pos[0]] == 0
+    patched, count = services.patch_crs_window_mode(patched, True)
+    assert count == 2
+    assert patched[services._crs_window_flag_record_positions(patched, b"VIDEO_RunInWindow")[0]] == 1
+    assert patched[services._window_mode_record_positions(patched)[0]] == 1
+
+
+def test_crs_window_mode_rejects_missing_record_without_modifying_input():
+    data = b"not a CRS file"
+    try:
+        services.patch_crs_window_mode(data, True)
+    except ValueError as exc:
+        assert "File was not modified" in str(exc)
+    else:
+        raise AssertionError("A missing WindowMode record should be rejected")
+    assert data == b"not a CRS file"
+
+
+def test_dgvoodoo_conf_settings_preserve_other_keys_and_force_watermark_off():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "game"
+        root.mkdir()
+        conf = root / "dgVoodoo.conf"
+        conf.write_bytes(
+            b"[General]\r\nKeepWindowAspectRatio = false\r\nEnumerateRefreshRates = false\r\n\r\n"
+            b"[DirectX]\r\nResolution = unforced\r\nDisableAndPassThru = false\r\ndgVoodooWatermark = true\r\n\r\n"
+            b"[DirectXExt]\r\nDepthBuffersBitDepth = appdriven\r\n"
+        )
+        backup = Path(td) / "backup"
+        services.patch_dgvoodoo_conf(conf, (2560, 1440, 74), "forcemin24bit", True, backup, root)
+        raw = conf.read_bytes()
+        assert b"Resolution = h:2560, v:1440, refrate:74\r\n" in raw
+        assert b"DisableAndPassThru = true\r\n" in raw
+        assert b"dgVoodooWatermark = false\r\n" in raw
+        assert b"DepthBuffersBitDepth = forcemin24bit\r\n" in raw
+        assert b"KeepWindowAspectRatio = false\r\n" in raw
+        assert (backup / "dgVoodoo.conf").is_file()
+        assert b"EnumerateRefreshRates = true\r\n" in raw
+        assert b"Filtering = bilinear\r\n" in raw
+        assert b"Antialiasing = appdriven\r\n" in raw
+        loaded = services.read_dgvoodoo_settings(conf)
+        assert loaded == {
+            "resolution": (2560, 1440, 74), "depth_mode": "forcemin24bit",
+            "disable_and_passthru": True, "filtering": "bilinear",
+            "antialiasing": "appdriven", "enumerate_refresh_rates": True,
+        }
+
+
+def test_dgvoodoo_installer_extracts_only_requested_x86_payloads_and_updates_config():
+    from io import BytesIO
+
+    payload = BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("dgVoodoo2/dgVoodooCpl.exe", b"MZ" + b"cpl binary")
+        archive.writestr("dgVoodoo2/dgVoodoo.conf", "[DirectX]\nResolution = unforced\ndgVoodooWatermark = true\n[DirectXExt]\nDepthBuffersBitDepth = appdriven\n".encode())
+        archive.writestr("dgVoodoo2/MS/x86/D3D8.dll", b"MZ" + b"x86 dll")
+        archive.writestr("dgVoodoo2/MS/x64/D3D8.dll", b"MZ" + b"x64 dll")
+
+    release = {
+        "tag_name": "v2.87.5",
+        "assets": [{"name": "dgVoodoo2_87_5.zip", "browser_download_url": "https://example.invalid/dgVoodoo2_87_5.zip"}],
+    }
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "game"; root.mkdir()
+        backup = Path(td) / "backup"
+        with patch.object(services, "github_json", return_value=release), patch.object(services, "download_bytes", return_value=payload.getvalue()) as download:
+            first = services.install_or_update_dgvoodoo(root, backup)
+            assert "v2.87.5" in first
+            assert (root / "dgVoodooCpl.exe").read_bytes().startswith(b"MZ")
+            assert not (root / "dgVoodoo.exe").exists()
+            assert (root / "d3d8.dll").read_bytes() == b"MZx86 dll"
+            assert not (root / "D3D8.dll").exists()
+            assert (root / "dgVoodoo.conf").is_file()
+            conf_raw = (root / "dgVoodoo.conf").read_bytes()
+            assert b"dgVoodooWatermark = false" in conf_raw
+            assert b"EnumerateRefreshRates = true" in conf_raw
+            assert b"Filtering = bilinear" in conf_raw
+            assert b"Antialiasing = appdriven" in conf_raw
+            assert services.read_dgvoodoo_settings(root / "dgVoodoo.conf")["resolution"] is not None
+            download.assert_called_once()
+            second = services.install_or_update_dgvoodoo(root, backup)
+            assert "up to date" in second.lower()
+            assert download.call_count == 1
+
+
+
+def test_dgvoodoo_installer_migrates_only_launcher_managed_legacy_cpl_filename():
+    from io import BytesIO
+    import hashlib
+
+    payload = BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("dgVoodoo2/dgVoodooCpl.exe", b"MZnew cpl")
+        archive.writestr("dgVoodoo2/dgVoodoo.conf", "[General]\nEnumerateRefreshRates = false\n[DirectX]\nFiltering = appdriven\nAntialiasing = appdriven\nResolution = unforced\n[DirectXExt]\nDepthBuffersBitDepth = appdriven\n".encode())
+        archive.writestr("dgVoodoo2/MS/x86/D3D8.dll", b"MZnew d3d8")
+
+    release = {
+        "tag_name": "v2.87.5",
+        "assets": [{"name": "dgVoodoo2_87_5.zip", "browser_download_url": "https://example.invalid/dgVoodoo2_87_5.zip"}],
+    }
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "game"; root.mkdir()
+        backup = Path(td) / "backup"; backup.mkdir()
+        legacy_payload = b"MZ old launcher-renamed control panel"
+        legacy_path = root / "dgVoodoo.exe"
+        legacy_path.write_bytes(legacy_payload)
+        services.write_json(services._component_state_path(backup), {
+            "components": {"dgvoodoo_cpl": {
+                "version": "v2.87.4", "filename": "dgVoodoo.exe",
+                "sha256": hashlib.sha256(legacy_payload).hexdigest(),
+            }}
+        })
+        with patch.object(services, "github_json", return_value=release), patch.object(services, "download_bytes", return_value=payload.getvalue()):
+            services.install_or_update_dgvoodoo(root, backup)
+        assert (root / "dgVoodooCpl.exe").read_bytes() == b"MZnew cpl"
+        assert not legacy_path.exists()
+        assert (backup / "dgVoodoo.exe").read_bytes() == legacy_payload
+        conf = (root / "dgVoodoo.conf").read_text(encoding="utf-8")
+        assert "EnumerateRefreshRates = true" in conf
+        assert "Filtering = bilinear" in conf
+        assert "Antialiasing = appdriven" in conf
+
+def test_validate_game_executable_distinguishes_clean_sample_from_modified_exe():
+    with tempfile.TemporaryDirectory() as td:
+        exe = Path(td) / "RCCars.exe"
+        exe.write_bytes(b"some fixture exe")
+        with patch.object(services, "_sha256_file", return_value=services.CLEAN_STANDALONE_EXE_SHA256), patch.object(services, "is_steam_stub_wrapped", return_value=False):
+            report = services.validate_game_executable(exe)
+            assert report["matches_reference"] is True
+            assert report["status"] == "clean_standalone"
+        with patch.object(services, "_sha256_file", return_value="unknown-hash"), patch.object(services, "is_steam_stub_wrapped", return_value=True):
+            report = services.validate_game_executable(exe)
+            assert report["matches_reference"] is False
+            assert report["status"] == "modified_steam"
+            assert report["reference_sha256"] == services.CLEAN_STEAM_EXE_SHA256
+
+
+def test_backup_file_once_keeps_executable_at_instance_backup_root():
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "game"
+        root.mkdir()
+        exe = root / "RCCars.exe"
+        exe.write_bytes(b"clean-or-current-exe")
+        backup = Path(td) / "data" / "backups" / "instance-1"
+        stored = services.backup_file_once(exe.parent, exe, backup)
+        assert stored == backup / "RCCars.exe"
+        assert stored.read_bytes() == b"clean-or-current-exe"

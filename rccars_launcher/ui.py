@@ -27,7 +27,7 @@ from .modmanager import (
     scan_mods,
 )
 
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.9"
 
 RU = {
     "Home": "Главная", "Instances": "Копии игры", "Game Settings": "Настройки игры",
@@ -97,6 +97,26 @@ RU = {
     "Resolution patch failed": "Не удалось изменить разрешение",
     "Could not update RCCars.crs before launch": "Не удалось обновить RCCars.crs перед запуском",
     "Launch the game anyway?": "Всё равно запустить игру?",
+    "Close launcher after launch": "Закрывать лаунчер после запуска",
+    "dgVoodoo": "dgVoodoo",
+    "dgVoodoo installed": "dgVoodoo установлен",
+    "dgVoodoo not installed": "dgVoodoo не установлен",
+    "dgVoodoo resolution": "Разрешение dgVoodoo",
+    "Filtering": "Фильтрация",
+    "MSAA antialiasing": "Сглаживание MSAA",
+    "Depth buffer": "Буфер глубины",
+    "Disable and pass through": "Отключить и передавать дальше",
+    "Run in window": "Запустить в окне",
+    "Apply all game settings": "Применить все настройки игры",
+    "Apply all game settings description": "Применяет настройки графики, параметры Config.gm, разрешение и оконный режим в RCCars.crs, язык игры и настройки dgVoodoo.",
+    "Install / update dgVoodoo": "Установить / обновить dgVoodoo",
+    "Applying game settings": "Применение настроек игры",
+    "Executable differs from clean sample": "EXE отличается от чистого образца",
+    "EXE validation": "Проверка EXE",
+    "Executable validation failed": "Не удалось проверить EXE",
+    "Could not back up the game EXE": "Не удалось создать резервную копию EXE игры",
+    "The executable was backed up, but its contents differ from the clean reference. The backup preserves the current file as it was when this instance was registered; it does not make a previously modified EXE clean.":
+        "EXE сохранён в резервную копию, но его содержимое отличается от чистого образца. Сохраняется текущий файл на момент добавления копии; ранее изменённый EXE от этого не становится чистым.",
 }
 
 
@@ -327,8 +347,8 @@ class LauncherWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"RC Cars Launcher {APP_VERSION}")
-        self.setMinimumSize(960, 620)
-        self.resize(1180, 780)
+        self.setMinimumSize(1120, 620)
+        self.resize(1360, 820)
         self.setStyleSheet(qss())
         self.pool = QThreadPool.globalInstance()
         self._workers: set[TaskWorker] = set()
@@ -342,11 +362,12 @@ class LauncherWindow(QMainWindow):
             # will be surfaced if a later operation actually needs the inaccessible files.
             pass
         self.prefs_file = self.data_dir / "launcher.json"
-        self.prefs = services.read_json(self.prefs_file, {"instances": [], "active_instance_id": "", "language": "en", "dev_mode": False})
+        self.prefs = services.read_json(self.prefs_file, {"instances": [], "active_instance_id": "", "language": "en", "dev_mode": False, "close_after_launch": False})
         self.prefs.setdefault("instances", [])
         self.prefs.setdefault("language", "en")
         self.prefs.setdefault("active_instance_id", "")
         self.prefs.setdefault("dev_mode", False)
+        self.prefs.setdefault("close_after_launch", False)
         self.app_config_path = self.app_dir / "launcher_config.json"
         if not self.app_config_path.exists():
             services.write_json(self.app_config_path, {
@@ -461,8 +482,17 @@ class LauncherWindow(QMainWindow):
         header_layout.addWidget(self.active_combo)
         refresh_btn = QPushButton(self.t("Refresh")); refresh_btn.clicked.connect(self.refresh_everything)
         header_layout.addWidget(refresh_btn)
+        launch_column_widget = QWidget()
+        launch_column = QVBoxLayout(launch_column_widget)
+        launch_column.setContentsMargins(0, 0, 0, 0)
+        launch_column.setSpacing(2)
         self.launch_btn = QPushButton(self.t("Launch Game")); self.launch_btn.setObjectName("Primary"); self.launch_btn.clicked.connect(self.launch_active_game)
-        header_layout.addWidget(self.launch_btn)
+        launch_column.addWidget(self.launch_btn)
+        self.close_after_launch_check = QCheckBox(self.t("Close launcher after launch"))
+        self.close_after_launch_check.setChecked(bool(self.prefs.get("close_after_launch", False)))
+        self.close_after_launch_check.toggled.connect(self._save_close_after_launch)
+        launch_column.addWidget(self.close_after_launch_check)
+        header_layout.addWidget(launch_column_widget)
         root_layout.addWidget(header)
 
         body = QHBoxLayout(); body.setContentsMargins(0, 0, 0, 0); body.setSpacing(0)
@@ -553,6 +583,7 @@ class LauncherWindow(QMainWindow):
         grid.addWidget(self._status_card("Large Address Aware", "home_laa", "▣"), 1, 0)
         grid.addWidget(self._status_card("Store", "home_store", "▤"), 1, 1)
         grid.addWidget(self._status_card("Graphics INI", "home_ini", "⚙"), 1, 2)
+        grid.addWidget(self._status_card("dgVoodoo", "home_dgvoodoo", "◈"), 2, 0)
         layout.addLayout(grid)
         actions_panel, actions_layout = self._panel("Core game actions")
         actions_row = QHBoxLayout()
@@ -614,6 +645,23 @@ class LauncherWindow(QMainWindow):
     def _build_game_settings_page(self) -> None:
         page, layout = self._scroll_page()
         self._heading(layout, "Game Settings", "Configure graphics fixes and the game configuration stored in Config.gm, RCCars.crs, and the Windows registry.")
+
+        # Keep the global apply action at the top so it remains easy to reach
+        # after changing controls further down the scrollable settings page.
+        apply_row = QHBoxLayout()
+        apply_note = QLabel(self.t("Apply all settings description"))
+        apply_note.setObjectName("Muted")
+        apply_note.setWordWrap(True)
+        apply_row.addWidget(apply_note, 1)
+        self.apply_all_settings_btn = QPushButton(self.t("Apply all game settings"))
+        self.apply_all_settings_btn.setObjectName("Primary")
+        self.apply_all_settings_btn.clicked.connect(self.apply_game_settings)
+        self.apply_all_settings_btn.setMinimumHeight(36)
+        apply_row.addWidget(self.apply_all_settings_btn, 0, Qt.AlignRight | Qt.AlignVCenter)
+        layout.addLayout(apply_row)
+
+        settings_top_row = QHBoxLayout()
+        settings_top_row.setSpacing(14)
         panel, box = self._panel("Display and aspect ratio")
         form = QFormLayout()
         self.resolution_combo = QComboBox(); self.resolution_combo.setMinimumWidth(240)
@@ -630,8 +678,39 @@ class LauncherWindow(QMainWindow):
         self.custom_resolution.toggled.connect(self._toggle_custom_resolution)
         self.resolution_combo.currentIndexChanged.connect(self._resolution_changed)
         form.addRow(self.t("Resolution"), res_widget)
+        self.run_in_window_check = QCheckBox(self.t("Run in window"))
         box.addLayout(form)
-        layout.addWidget(panel)
+        box.addWidget(self.run_in_window_check)
+        settings_top_row.addWidget(panel, 3)
+
+        dg_panel, dg_box = self._panel("dgVoodoo")
+        dg_form = QFormLayout()
+        self.dg_resolution_combo = QComboBox()
+        self.dg_resolution_combo.setMinimumWidth(250)
+        for w, h, hz in services.available_display_modes():
+            self.dg_resolution_combo.addItem(f"{w} × {h} @ {hz} Hz", (w, h, hz))
+        self.dg_filtering_combo = QComboBox()
+        for value in ("appdriven", "pointsampled", "bilinear", "pointmip", "linearmip", "trilinear", "2", "4", "8", "16"):
+            self.dg_filtering_combo.addItem(value, value)
+        self.dg_filtering_combo.setCurrentIndex(self.dg_filtering_combo.findData("bilinear"))
+        self.dg_antialiasing_combo = QComboBox()
+        for value in ("appdriven", "off", "2x", "4x", "8x"):
+            self.dg_antialiasing_combo.addItem(value, value)
+        self.dg_depth_combo = QComboBox()
+        for label, value in [("appdriven", "appdriven"), ("forcemin24bit", "forcemin24bit"), ("force32bit", "force32bit")]:
+            self.dg_depth_combo.addItem(label, value)
+        self.dg_disable_passthru = QCheckBox(self.t("Disable and pass through"))
+        dg_form.addRow(self.t("dgVoodoo resolution"), self.dg_resolution_combo)
+        dg_form.addRow(self.t("Filtering"), self.dg_filtering_combo)
+        dg_form.addRow(self.t("MSAA antialiasing"), self.dg_antialiasing_combo)
+        dg_form.addRow(self.t("Depth buffer"), self.dg_depth_combo)
+        dg_box.addLayout(dg_form)
+        dg_box.addWidget(self.dg_disable_passthru)
+        self.install_dgvoodoo_btn = QPushButton(self.t("Install / update dgVoodoo"))
+        self.install_dgvoodoo_btn.clicked.connect(self.install_dgvoodoo)
+        dg_box.addWidget(self.install_dgvoodoo_btn, 0, Qt.AlignLeft)
+        settings_top_row.addWidget(dg_panel, 2)
+        layout.addLayout(settings_top_row)
 
         panel, box = self._panel("FOV and HUD")
         self.fix_fov = QCheckBox(self.t("Fix FOV automatically")); self.fix_fov.setChecked(True)
@@ -651,10 +730,8 @@ class LauncherWindow(QMainWindow):
         fpsrow = QHBoxLayout(); fpsrow.addWidget(QLabel(self.t("FPS limit (0 = monitor refresh rate)")))
         self.fps_spin = QSpinBox(); self.fps_spin.setRange(0, 600); self.fps_spin.setValue(0); fpsrow.addWidget(self.fps_spin); fpsrow.addStretch(1); box.addLayout(fpsrow)
         self.no_minimize = QCheckBox(self.t("Prevent minimize on focus loss")); box.addWidget(self.no_minimize)
-        save_btn = QPushButton(self.t("Save graphics settings")); save_btn.setObjectName("Primary"); save_btn.clicked.connect(self.save_graphics_settings)
-        box.addWidget(save_btn, 0, Qt.AlignLeft)
         layout.addWidget(panel)
-        note = QLabel(self.t("Settings are written to RCCars_WidescreenFix.ini. Resolution is also patched in RCCars.crs when the file exists.")); note.setObjectName("Muted"); note.setWordWrap(True); layout.addWidget(note)
+        note = QLabel(self.t("Settings are written to RCCars_WidescreenFix.ini. Resolution and WindowMode are also patched in RCCars.crs when the file exists.")); note.setObjectName("Muted"); note.setWordWrap(True); layout.addWidget(note)
 
         cfg_panel, cfg_layout = self._panel("Game configuration")
         self.cfg_fog = QCheckBox(self.t("Fog"))
@@ -671,12 +748,7 @@ class LauncherWindow(QMainWindow):
         cfg_layout.addLayout(lang_row)
         crs_note = QLabel(self.t("RCCars.crs is patched only if it exists. The launcher backs it up before modifying it."))
         crs_note.setObjectName("Muted"); crs_note.setWordWrap(True); cfg_layout.addWidget(crs_note)
-        self.apply_game_cfg_btn = QPushButton(self.t("Apply game settings"))
-        self.apply_game_cfg_btn.setObjectName("Primary")
-        self.apply_game_cfg_btn.clicked.connect(self.apply_game_settings)
-        cfg_layout.addWidget(self.apply_game_cfg_btn, 0, Qt.AlignLeft)
         layout.addWidget(cfg_panel)
-
         layout.addStretch(1)
         self.stack.addWidget(page); self.pages["Game Settings"] = page
 
@@ -847,7 +919,7 @@ class LauncherWindow(QMainWindow):
         if not instance or root is None:
             self.widgets["home_instance_name"].setText(self.t("No instance"))
             self.widgets["home_instance_path"].setText(self.t("Select a game instance first."))
-            for key in ("home_pack", "home_wsf", "home_loader", "home_laa", "home_store", "home_ini"):
+            for key in ("home_pack", "home_wsf", "home_loader", "home_laa", "home_store", "home_ini", "home_dgvoodoo"):
                 self.widgets[key].setText("—")
             self.launch_btn.setEnabled(False)
             self.pack_btn.setEnabled(False); self.pack_btn.setText(self.t("Extract RCCars.pack into game root"))
@@ -863,6 +935,7 @@ class LauncherWindow(QMainWindow):
         self.widgets["home_laa"].setText(self.t("Enabled") if details["large_address_aware"] else self.t("Not detected"))
         self.widgets["home_store"].setText(self.t("Steam") if details["steam"] else self.t("Standalone"))
         self.widgets["home_ini"].setText(self.t("Present") if details["ini_file"] else self.t("Not detected"))
+        self.widgets["home_dgvoodoo"].setText(self.t("dgVoodoo installed") if details.get("dgvoodoo") else self.t("dgVoodoo not installed"))
         self.launch_btn.setEnabled(details["valid_exe"])
         if details["pack_status"] == "unpacked":
             self.pack_btn.setText(self.t("Pack is already unpacked"))
@@ -947,10 +1020,29 @@ class LauncherWindow(QMainWindow):
             QMessageBox.warning(self, self.t("Warning"), self.t("Choose a valid game folder containing RCCars.exe.")); return
         path = Path(values["path"]).expanduser()
         try:
-            services.locate_game_exe(path)
-        except FileNotFoundError:
-            QMessageBox.warning(self, self.t("Warning"), self.t("Choose a valid game folder containing RCCars.exe.")); return
+            exe = services.locate_game_exe(path)
+            validation = services.validate_game_executable(exe)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            QMessageBox.warning(self, self.t("Executable validation failed"), str(exc)); return
+        if not validation["matches_reference"]:
+            detail = (
+                f"{self.t('Executable differs from clean sample')}\n\n"
+                f"{validation['description']}\n\n"
+                f"SHA-256: {validation['sha256']}\n"
+                f"Reference SHA-256: {validation['reference_sha256']}\n\n"
+                f"{self.t('The executable was backed up, but its contents differ from the clean reference. The backup preserves the current file as it was when this instance was registered; it does not make a previously modified EXE clean.')}"
+            )
+            QMessageBox.warning(self, self.t("EXE validation"), detail)
         instance = services.new_instance(values["name"] or path.name, path, values["icon"])
+        instance["exe_validation"] = {"status": validation["status"], "sha256": validation["sha256"]}
+        backup_root = self.data_dir / "backups" / str(instance["id"])
+        try:
+            # Preserve the EXE exactly as it exists at registration time. Later patches
+            # use backup_file_once, so this baseline is never silently overwritten.
+            services.backup_file_once(exe.parent, exe, backup_root)
+        except OSError as exc:
+            QMessageBox.critical(self, self.t("Error"), f"{self.t('Could not back up the game EXE')}:\n{exc}")
+            return
         self.instances.append(instance)
         if not self.active_instance_id:
             self.active_instance_id = instance["id"]
@@ -1164,7 +1256,8 @@ class LauncherWindow(QMainWindow):
             report(10, "Updating WidescreenFix INI…")
             path = services.update_graphics_ini(root, int(width), int(height), self.fix_fov.isChecked(), self.fov_spin.value(), self.fix_hud.isChecked(), self.legacy_fix_hud.isChecked(), self.fps_spin.value(), self.no_minimize.isChecked(), backup)
             report(75, "Checking the game settings file…")
-            crs_message = services.patch_crs_file_if_present(root, int(width), int(height), backup)
+            windowed_mode = self.run_in_window_check.isChecked() if hasattr(self, "run_in_window_check") else None
+            crs_message = services.patch_crs_file_if_present(root, int(width), int(height), backup, windowed=windowed_mode)
             report(100, "Settings saved")
             return str(path), crs_message
         def success(result):
@@ -1190,6 +1283,60 @@ class LauncherWindow(QMainWindow):
         current = services.get_game_language()
         index = self.game_language_combo.findText(current, Qt.MatchFixedString)
         if index >= 0: self.game_language_combo.setCurrentIndex(index)
+        crs_path = root / "RCCars.crs"
+        windowed = None
+        if crs_path.is_file():
+            try:
+                windowed = services.read_crs_windowed(crs_path.read_bytes())
+            except OSError:
+                windowed = None
+        self.run_in_window_check.setChecked(bool(windowed) if windowed is not None else False)
+        dg_path = root / "dgVoodoo.conf"
+        dg_settings = services.read_dgvoodoo_settings(dg_path)
+        backup = self.current_backup_root()
+        pending = services.read_json(backup / "dgvoodoo_settings.json", {}) if backup else {}
+        if not dg_path.is_file() and pending:
+            try:
+                pending_resolution = tuple(int(v) for v in pending.get("resolution", []))
+                if len(pending_resolution) == 3:
+                    dg_settings["resolution"] = pending_resolution
+                dg_settings["depth_mode"] = str(pending.get("depth_mode", dg_settings["depth_mode"]))
+                dg_settings["disable_and_passthru"] = bool(pending.get("disable_and_passthru", False))
+                dg_settings["filtering"] = str(pending.get("filtering", dg_settings.get("filtering", "bilinear")))
+                dg_settings["antialiasing"] = str(pending.get("antialiasing", dg_settings.get("antialiasing", "appdriven")))
+            except (TypeError, ValueError):
+                pass
+        dg_resolution = dg_settings.get("resolution") or (
+            services.current_display_resolution()[0], services.current_display_resolution()[1], services.current_display_refresh_rate()
+        )
+        dg_index = self.dg_resolution_combo.findData(tuple(dg_resolution))
+        if dg_index < 0:
+            self.dg_resolution_combo.addItem(f"{dg_resolution[0]} × {dg_resolution[1]} @ {dg_resolution[2]} Hz (current config)", tuple(dg_resolution))
+            dg_index = self.dg_resolution_combo.findData(tuple(dg_resolution))
+        self.dg_resolution_combo.setCurrentIndex(dg_index)
+        filtering_index = self.dg_filtering_combo.findData(dg_settings.get("filtering", "bilinear"))
+        self.dg_filtering_combo.setCurrentIndex(max(0, filtering_index))
+        antialiasing_index = self.dg_antialiasing_combo.findData(dg_settings.get("antialiasing", "appdriven"))
+        self.dg_antialiasing_combo.setCurrentIndex(max(0, antialiasing_index))
+        depth_index = self.dg_depth_combo.findData(dg_settings.get("depth_mode", "appdriven"))
+        self.dg_depth_combo.setCurrentIndex(max(0, depth_index))
+        self.dg_disable_passthru.setChecked(bool(dg_settings.get("disable_and_passthru", False)))
+        self._set_dgvoodoo_status(services.detect_instance(root).get("dgvoodoo", False))
+
+    def _set_dgvoodoo_status(self, installed: bool) -> None:
+        if hasattr(self, "install_dgvoodoo_btn"):
+            self.install_dgvoodoo_btn.setText(self.t("Install / update dgVoodoo"))
+            self.install_dgvoodoo_btn.setToolTip(self.t("dgVoodoo installed") if installed else self.t("dgVoodoo not installed"))
+
+    def install_dgvoodoo(self) -> None:
+        item = self._get_required_instance()
+        if not item: return
+        _instance, root, backup = item
+        self.run_task(
+            self.t("Install / update dgVoodoo"),
+            lambda report: services.install_or_update_dgvoodoo(root, backup, report),
+            lambda message: (QMessageBox.information(self, self.t("Success"), message), self.load_game_settings()),
+        )
 
     def apply_game_settings(self) -> None:
         item = self._get_required_instance()
@@ -1199,20 +1346,54 @@ class LauncherWindow(QMainWindow):
         if answer != QMessageBox.Yes: return
         flags = {"VIDEO_UseFog": self.cfg_fog.isChecked(), "Gamma_Changes": self.cfg_gamma.isChecked(), "AutoRunIntro": self.cfg_intro.isChecked()}
         language = self.game_language_combo.currentText()
+        if self.custom_resolution.isChecked():
+            width, height = self.width_spin.value(), self.height_spin.value()
+        else:
+            selected = self.resolution_combo.currentData()
+            width, height = selected if selected else (self.width_spin.value(), self.height_spin.value())
+        dg_resolution = self.dg_resolution_combo.currentData()
+        if not dg_resolution:
+            dg_resolution = (services.current_display_resolution()[0], services.current_display_resolution()[1], services.current_display_refresh_rate())
+        depth_mode = str(self.dg_depth_combo.currentData() or "appdriven")
+        filtering = str(self.dg_filtering_combo.currentData() or "bilinear")
+        antialiasing = str(self.dg_antialiasing_combo.currentData() or "appdriven")
+        disable_passthru = self.dg_disable_passthru.isChecked()
+        windowed = self.run_in_window_check.isChecked()
+        fix_fov = self.fix_fov.isChecked()
+        custom_fov = self.fov_spin.value()
+        fix_hud = self.fix_hud.isChecked()
+        legacy_hud = self.legacy_fix_hud.isChecked()
+        fps_limit = self.fps_spin.value()
+        no_minimize = self.no_minimize.isChecked()
         def task(report):
-            report(15, "Updating Config.gm…")
-            gm_message = services.patch_config_gm(root, flags, backup)
-            report(40, "Patching RCCars.crs if present…")
-            if hasattr(self, "width_spin"):
-                if self.custom_resolution.isChecked(): width, height = self.width_spin.value(), self.height_spin.value()
-                else:
-                    res = self.resolution_combo.currentData(); width, height = res if res else (self.width_spin.value(), self.height_spin.value())
-            else: width, height = services.current_display_resolution()
-            crs_message = services.patch_crs_file_if_present(root, int(width), int(height), backup)
-            report(70, "Updating the Windows game-language setting…")
-            registry_message = services.set_game_language(language)
-            report(100, "Game settings applied")
-            return gm_message, crs_message, registry_message
+            messages = []
+            report(10, "Updating WidescreenFix INI…")
+            ini_path = services.update_graphics_ini(root, int(width), int(height), fix_fov, custom_fov, fix_hud, legacy_hud, fps_limit, no_minimize, backup)
+            messages.append(f"WidescreenFix INI: {ini_path}")
+            report(28, "Patching RCCars.crs resolution and window mode…")
+            messages.append(services.patch_crs_file_if_present(root, int(width), int(height), backup, windowed=windowed))
+            report(48, "Updating Config.gm…")
+            messages.append(services.patch_config_gm(root, flags, backup))
+            report(65, "Updating game language…")
+            messages.append(services.set_game_language(language))
+            dg_conf = root / "dgVoodoo.conf"
+            # Persist these values per instance even before dgVoodoo is installed, so
+            # installing the wrapper later picks up the user's selections.
+            services.write_json(backup / "dgvoodoo_settings.json", {
+                "resolution": [int(dg_resolution[0]), int(dg_resolution[1]), int(dg_resolution[2])],
+                "depth_mode": depth_mode,
+                "disable_and_passthru": bool(disable_passthru),
+                "filtering": filtering,
+                "antialiasing": antialiasing,
+            })
+            if dg_conf.is_file():
+                report(82, "Updating dgVoodoo.conf…")
+                services.patch_dgvoodoo_conf(dg_conf, tuple(dg_resolution), depth_mode, disable_passthru, backup, root, filtering, antialiasing)
+                messages.append("dgVoodoo.conf updated.")
+            else:
+                messages.append("dgVoodoo.conf not installed; dgVoodoo settings saved and will be applied when the wrapper is installed.")
+            report(100, "All game settings applied")
+            return messages
         self.run_task(self.t("Applying game settings"), task,
                       lambda result: QMessageBox.information(self, self.t("Success"), "\n".join(result)))
 
@@ -1431,7 +1612,8 @@ class LauncherWindow(QMainWindow):
                     width, height = selected if selected else (self.width_spin.value(), self.height_spin.value())
             else:
                 width, height = services.current_display_resolution()
-            crs_message = services.patch_crs_file_if_present(root, int(width), int(height), backup)
+            windowed_mode = self.run_in_window_check.isChecked() if hasattr(self, "run_in_window_check") else None
+            crs_message = services.patch_crs_file_if_present(root, int(width), int(height), backup, windowed=windowed_mode)
         except Exception as exc:
             answer = QMessageBox.question(
                 self,
@@ -1445,10 +1627,17 @@ class LauncherWindow(QMainWindow):
             crs_message = "RCCars.crs could not be patched; launched anyway."
 
         try:
-            services.launch_game(root, bool(self.prefs.get("dev_mode", False)))
+            process = services.launch_game(root, bool(self.prefs.get("dev_mode", False)))
             self.statusBar().showMessage(f"{self.t('Game process started.')} {crs_message}", 8000)
+            if self.prefs.get("close_after_launch", False):
+                # Let Qt flush its final UI events and allow the process to initialize.
+                QTimer.singleShot(250, self.close)
         except Exception as exc:
             QMessageBox.critical(self, self.t("Error"), str(exc))
+
+    def _save_close_after_launch(self, checked: bool) -> None:
+        self.prefs["close_after_launch"] = bool(checked)
+        self.save_prefs()
 
     def save_launcher_repo(self) -> None:
         self.app_config["launcher_update_repo"] = self.update_repo_edit.text().strip()

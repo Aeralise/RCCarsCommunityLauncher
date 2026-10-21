@@ -1,4 +1,4 @@
-# RC Cars Launcher (prototype 0.1.6)
+# RC Cars Launcher (prototype 0.1.9)
 
 A Windows-oriented Python/Qt launcher and modding utility for **RC Cars (2003)**. This is the first functional project scaffold: source code is included; build the Windows EXE locally using the batch file.
 
@@ -43,7 +43,7 @@ For the full step-by-step repository/release setup, see [`docs/GITHUB_UPDATES.md
 
 The combined compatibility installer checks the latest WidescreenFix GitHub Release and Ultimate ASI Loader's moving `Win32-latest` x86 asset. It records the upstream release token and installed file SHA-256 per instance: the next click checks for updates, downloads only changed components, and leaves the existing WidescreenFix INI intact. The loader is taken from `Win32-latest/dinput8-Win32.zip` because RC Cars is a 32-bit game.
 
-The launcher's self-updater needs a GitHub repository with Releases. Set `launcher_update_repo` in `launcher_config.json` to `owner/repository` and attach `RCCarsLauncher_Portable.zip` to every release (the updater prefers it over a direct EXE because this is a one-directory build). The ZIP must contain `RCCarsLauncher.exe` and `_runtime/` at its root. Update releases should use tags matching `APP_VERSION`, e.g. `v0.1.6`.
+The launcher's self-updater needs a GitHub repository with Releases. Set `launcher_update_repo` in `launcher_config.json` to `owner/repository` and attach `RCCarsLauncher_Portable.zip` to every release (the updater prefers it over a direct EXE because this is a one-directory build). The ZIP must contain `RCCarsLauncher.exe` and `_runtime/` at its root. Update releases should use tags matching `APP_VERSION`, e.g. `v0.1.9`.
 
 ## Notes / safety
 
@@ -64,6 +64,7 @@ RCCarsLauncher/
   launcher_config.json
   launcher_icon.ico       # optional custom icon; add your own .ico file
   docs/GITHUB_UPDATES.md
+  docs/DGVOODOO_INTEGRATION.md
   social_links.json
   requirements.txt
   build_exe.bat
@@ -81,3 +82,10 @@ Attach `RCCarsLauncher_Portable.zip` to the release. The archive should contain 
 ## Run regression tests
 
 From the project directory, run `py -3 -m pytest -q`. The current test suite covers INI line endings, Pack extraction/renaming, CRS and Config.gm patching, language mapping, LAA behavior, mod overlay cleanup/conflicts, persistent extraction caching, and skipping copies for unchanged files. Qt drag-and-drop and immediate UI language switching should also be smoke-tested on Windows after installing requirements.
+
+
+## dgVoodoo integration (0.1.8)
+
+The launcher can install/update the official dgVoodoo2 release into a selected game instance. It installs only `dgVoodooCpl.exe` (under its official name), `dgVoodoo.conf`, and the 32-bit `MS/x86/D3D8.dll` as `d3d8.dll`. The config watermark is disabled automatically and `[General] EnumerateRefreshRates = true` is enforced. The Game Settings page exposes the DirectX resolution/refresh rate, filtering (default `bilinear`), MSAA antialiasing, depth-buffer mode, and Disable-and-pass-through flag. When upgrading from older launcher builds, the launcher removes a legacy `dgVoodoo.exe` only if its stored SHA-256 proves it is the file installed under the wrong name by the previous launcher version. Settings can be saved per instance before dgVoodoo is installed, then applied during installation.
+
+When registering an instance, `RCCars.exe` is SHA-256-compared to the clean standalone and Steam samples supplied for this project. A mismatch triggers a warning and a one-time backup of the current EXE under the launcher's `data/backups/<instance-id>/RCCars.exe`. The backup preserves the EXE as found; it does not replace or clean a modified executable.
