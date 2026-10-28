@@ -11,6 +11,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+
 from PySide6.QtCore import Qt, QRunnable, QThreadPool, QObject, Signal, QSize, Slot, QTimer
 from PySide6.QtGui import QIcon, QFont, QAction
 from PySide6.QtWidgets import (
@@ -27,7 +28,17 @@ from .modmanager import (
     scan_mods,
 )
 
-APP_VERSION = "0.1.9"
+from .rccarspy.tools.rccars_patcher import (PatchParser, PatchWrongFileError, PatchCorruptedFileError, PatchWrongChunkError,
+    PatchStruct, convert_version_hex_2_str, convert_version_hex_2_tuple, install_patch, get_patch_description_by_language_code
+)
+from .rccarspy.handlers.tiohb_handler import tiohbReadDWord
+
+APP_VERSION = "0.2.0"
+
+# ОБЩИЕ ПРОБЛЕМЫ, КОТОРЫЕ ЗАМЕТИЛ
+# 1. Бэкапы копий накапливаются и не удаляется при удалении копии
+# 2. Если выбрать пустую папку, то сохраняется папка Mods, хотя папка пуста и даннные игры отсутсвуют.
+# 3. Надо как-то обновлять instance после патчинга, т.к. значения изменились и теперь версия не чистая, а патченная
 
 RU = {
     "Home": "Главная", "Instances": "Копии игры", "Game Settings": "Настройки игры",
@@ -117,6 +128,38 @@ RU = {
     "Could not back up the game EXE": "Не удалось создать резервную копию EXE игры",
     "The executable was backed up, but its contents differ from the clean reference. The backup preserves the current file as it was when this instance was registered; it does not make a previously modified EXE clean.":
         "EXE сохранён в резервную копию, но его содержимое отличается от чистого образца. Сохраняется текущий файл на момент добавления копии; ранее изменённый EXE от этого не становится чистым.",
+    # ---- Патчинг ----
+    "Патчинг игры": "Патчинг игры",
+    "Патчинг": "Патчинг",
+    "Состояние": "Состояние",
+    "Версия патча": "Версия патча",
+    "Патч-файл": "Патч-файл",
+    "Файл патча не выбран": "Файл патча не выбран",
+    "Выбрать патч-файл…": "Выбрать патч-файл…",
+    "Описание патча": "Описание патча",
+    "Название патча": "Название патча",
+    "Статус": "Статус",
+    "Описание": "Описание",
+    "Описание не загружено.": "Описание не загружено.",
+    "Файлы в патче": "Файлы в патче",
+    "Файл в патче": "Файл в патче",
+    "Устанавливается в": "Устанавливается в",
+    "Действие": "Действие",
+    "Установить": "Установить",
+    "Закрыть": "Закрыть",
+    "Установка патча": "Установка патча",
+    "Патч-файлы (*.zip *.7z *.exe *.dll *.asi *.bin);;Все файлы (*.*)":
+    "Патч-файлы (*.zip *.7z *.exe *.dll *.asi *.bin);;Все файлы (*.*)",
+    "Сначала выберите патч-файл.": "Сначала выберите патч-файл.",
+    "Я понимаю и принимаю ответственность": "Я понимаю и принимаю ответственность",
+    "Разработчики лаунчера и авторы патча не несут ответственности за внесение изменений в исполняемый exe-файл. Внося изменения, вы подтверждаете, что делаете это осознанно и по собственному желанию.":
+    "Разработчики лаунчера и авторы патча не несут ответственности за внесение изменений в исполняемый exe-файл. Внося изменения, вы подтверждаете, что делаете это осознанно и по собственному желанию.",
+    "Патч установлен.": "Патч установлен.",
+    "Ошибка валидации патча": "Ошибка валидации патча",
+    "Патч-файл не прошёл проверку.": "Патч-файл не прошёл проверку.",
+    "Ошибка чтения патч-файла": "Ошибка чтения патч-файла",
+    "Не удалось прочитать патч-файл.": "Не удалось прочитать патч-файл.",
+    "Неизвестная ошибка при разборе патч-файла.": "Неизвестная ошибка при разборе патч-файла."
 }
 
 
@@ -268,6 +311,56 @@ class InstanceDialog(QDialog):
         return {"name": self.name_edit.text().strip(), "path": self.path_edit.text().strip(), "icon": self.icon_edit.text().strip()}
 
 
+class PatchDisclaimerDialog(QDialog):
+    """Попап с предупреждением перед установкой патча.
+
+    Кнопка «Установить» заблокирована до установки галочки.
+    Никакой логики установки здесь нет — только UI.
+    """
+
+    def __init__(self, parent: QWidget, title: str, patch_name: str = "", patch_version: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(560)
+        self.setStyleSheet(qss())
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        head = QLabel(parent.t("Установка патча"))
+        head.setStyleSheet("font-size:15pt;font-weight:700;")
+        layout.addWidget(head)
+
+        if patch_name:
+            info = QLabel(patch_name + (f"  ·  v{patch_version}" if patch_version else ""))
+            info.setObjectName("Muted")
+            layout.addWidget(info)
+
+        text = QLabel(parent.t(
+            "Разработчики лаунчера и авторы патча не несут ответственности "
+            "за внесение изменений в исполняемый exe-файл. Внося изменения, "
+            "вы подтверждаете, что делаете это осознанно и по собственному желанию."
+        ))
+        text.setWordWrap(True)
+        layout.addWidget(text)
+
+        self.accept_check = QCheckBox(parent.t("Я понимаю и принимаю ответственность"))
+        layout.addWidget(self.accept_check)
+
+        buttons = QDialogButtonBox()
+        self.install_btn = QPushButton(parent.t("Установить"))
+        self.install_btn.setObjectName("Primary")
+        self.install_btn.setEnabled(False)
+        close_btn = QPushButton(parent.t("Закрыть"))
+        close_btn.clicked.connect(self.reject)
+        buttons.addButton(self.install_btn, QDialogButtonBox.AcceptRole)
+        buttons.addButton(close_btn, QDialogButtonBox.RejectRole)
+        self.install_btn.clicked.connect(self.accept)
+        layout.addWidget(buttons)
+
+        self.accept_check.toggled.connect(self.install_btn.setEnabled)
+
+
 class _ArchiveDropMixin:
     """Shared drag-and-drop handling for the mod page and archive table."""
 
@@ -341,8 +434,8 @@ class ModArchiveDropTable(QTableWidget, _ArchiveDropMixin):
 
 
 class LauncherWindow(QMainWindow):
-    NAV_KEYS = ["Home", "Instances", "Game Settings", "Mod Manager", "Tools", "Settings & Updates"]
-    NAV_SYMBOLS = {"Home": "⌂", "Instances": "▣", "Game Settings": "◐", "Mod Manager": "▤", "Tools": "⌘", "Settings & Updates": "↻"}
+    NAV_KEYS = ["Home", "Instances", "Game Settings", "Patch", "Mod Manager", "Tools", "Settings & Updates"]
+    NAV_SYMBOLS = {"Home": "⌂", "Instances": "▣", "Game Settings": "◐", "Patch": "✎", "Mod Manager": "▤", "Tools": "⌘", "Settings & Updates": "↻"}
 
     def __init__(self):
         super().__init__()
@@ -358,8 +451,6 @@ class LauncherWindow(QMainWindow):
         try:
             services.migrate_legacy_user_data(self.data_dir)
         except OSError:
-            # The portable data directory remains the configured destination; errors
-            # will be surfaced if a later operation actually needs the inaccessible files.
             pass
         self.prefs_file = self.data_dir / "launcher.json"
         self.prefs = services.read_json(self.prefs_file, {"instances": [], "active_instance_id": "", "language": "en", "dev_mode": False, "close_after_launch": False})
@@ -394,10 +485,13 @@ class LauncherWindow(QMainWindow):
         self._mod_apply_timer.setSingleShot(True)
         self._mod_apply_timer.setInterval(550)
         self._mod_apply_timer.timeout.connect(self._apply_pending_mod_changes)
+
+        # ---- Патчинг: поля ----
+        self.patch_file_path: Optional[Path] = None
+        self.patch_data: Optional[PatchStruct] = None
+
         self._build_ui()
         self._sync_active_combo()
-        # Show the window before doing filesystem scans and instance detection.
-        # The one-directory build below also avoids PyInstaller one-file extraction at startup.
         QTimer.singleShot(120, self.refresh_startup_state)
 
     def t(self, text: str) -> str:
@@ -428,7 +522,6 @@ class LauncherWindow(QMainWindow):
         return path
 
     def _resolve_launcher_icon(self) -> QIcon:
-        """Load the optional custom icon from bundled resources or beside the launcher."""
         roots: list[Path] = []
         bundled_dir = getattr(sys, "_MEIPASS", None)
         if bundled_dir:
@@ -467,8 +560,6 @@ class LauncherWindow(QMainWindow):
             logo.setStyleSheet("background:transparent;")
             self.setWindowIcon(launcher_icon)
         else:
-            # Do not show the old orange placeholder; use a neutral system icon
-            # until launcher_icon.ico is supplied in the project root.
             logo.setPixmap(self.style().standardIcon(QStyle.SP_ComputerIcon).pixmap(QSize(42, 42)))
             logo.setStyleSheet("background:transparent;")
         brand_box = QVBoxLayout(); brand_box.setSpacing(1)
@@ -517,13 +608,13 @@ class LauncherWindow(QMainWindow):
         self._build_home_page()
         self._build_instances_page()
         self._build_game_settings_page()
+        self._build_patch_page()
         self._build_mods_page()
         self._build_tools_page()
         self._build_settings_page()
         self.show_page(self.current_page_key)
 
     def _scroll_page(self) -> tuple[QScrollArea, QVBoxLayout]:
-        """Create a page with a vertical scrollbar instead of compressing its contents."""
         scroll = QScrollArea()
         scroll.setObjectName("PageScrollArea")
         scroll.setFrameShape(QFrame.NoFrame)
@@ -646,8 +737,6 @@ class LauncherWindow(QMainWindow):
         page, layout = self._scroll_page()
         self._heading(layout, "Game Settings", "Configure graphics fixes and the game configuration stored in Config.gm, RCCars.crs, and the Windows registry.")
 
-        # Keep the global apply action at the top so it remains easy to reach
-        # after changing controls further down the scrollable settings page.
         apply_row = QHBoxLayout()
         apply_note = QLabel(self.t("Apply all settings description"))
         apply_note.setObjectName("Muted")
@@ -752,6 +841,335 @@ class LauncherWindow(QMainWindow):
         layout.addStretch(1)
         self.stack.addWidget(page); self.pages["Game Settings"] = page
 
+    # ------------------------------------------------------------------
+    # Патчинг: страница
+    # ------------------------------------------------------------------
+    def _build_patch_page(self) -> None:
+        page, layout = self._scroll_page()
+        self._heading(
+            layout, "Патчинг игры",
+            "Установка патчей, изменяющих логику работы игры и исполняемый файл.",
+        )
+
+        # ---------- 1. Информация об активном экземпляре ----------
+        info_panel, info_box = self._panel("Активный экземпляр игры")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(6)
+        self.widgets["patch_instance_name"] = QLabel("—")
+        self.widgets["patch_instance_name"].setStyleSheet("font-size:14pt;font-weight:700;")
+        self.widgets["patch_instance_path"] = QLabel("—")
+        self.widgets["patch_instance_path"].setObjectName("Muted")
+        self.widgets["patch_instance_path"].setWordWrap(True)
+        self.widgets["patch_instance_status"] = QLabel("—")
+        self.widgets["patch_instance_status"].setObjectName("StatusValue")
+        self.widgets["patch_instance_version"] = QLabel("—")
+        self.widgets["patch_instance_version"].setObjectName("StatusValue")
+
+        grid.addWidget(QLabel(self.t("Name")), 0, 0)
+        grid.addWidget(self.widgets["patch_instance_name"], 0, 1)
+        grid.addWidget(QLabel(self.t("Game folder")), 1, 0)
+        grid.addWidget(self.widgets["patch_instance_path"], 1, 1)
+        grid.addWidget(QLabel(self.t("Состояние")), 2, 0)
+        grid.addWidget(self.widgets["patch_instance_status"], 2, 1)
+        grid.addWidget(QLabel(self.t("Версия патча")), 3, 0)
+        grid.addWidget(self.widgets["patch_instance_version"], 3, 1)
+        grid.setColumnStretch(1, 1)
+        info_box.addLayout(grid)
+        layout.addWidget(info_panel)
+
+        # ---------- 2. Выбор патч-файла ----------
+        file_panel, file_box = self._panel("Патч-файл")
+        row = QHBoxLayout()
+        self.patch_path_edit = QLineEdit()
+        self.patch_path_edit.setReadOnly(True)
+        self.patch_path_edit.setPlaceholderText(self.t("Файл патча не выбран"))
+        self.patch_browse_btn = QPushButton(self.t("Выбрать патч-файл…"))
+        self.patch_browse_btn.clicked.connect(self._choose_patch_file)
+        row.addWidget(self.patch_path_edit, 1)
+        row.addWidget(self.patch_browse_btn)
+        file_box.addLayout(row)
+        layout.addWidget(file_panel)
+
+        # ---------- 3. Описание патча ----------
+        desc_panel, desc_box = self._panel("Описание патча")
+        form = QFormLayout()
+        self.patch_name_label = QLabel("—")
+        self.patch_name_label.setStyleSheet("font-size:13pt;font-weight:700;")
+        self.patch_version_label = QLabel("—")
+        self.patch_status_label = QLabel("—")
+        self.patch_status_label.setObjectName("Muted")
+        self.patch_desc_view = QLabel(self.t("Описание не загружено."))
+        self.patch_desc_view.setWordWrap(True)
+        self.patch_desc_view.setStyleSheet(
+            "background:#10151d;border:1px solid #354258;border-radius:6px;padding:10px;"
+        )
+        self.patch_desc_view.setMinimumHeight(90)
+        form.addRow(self.t("Название патча"), self.patch_name_label)
+        form.addRow(self.t("Версия патча"), self.patch_version_label)
+        form.addRow(self.t("Статус"), self.patch_status_label)
+        form.addRow(self.t("Описание"), self.patch_desc_view)
+        desc_box.addLayout(form)
+
+        desc_box.addWidget(QLabel(self.t("Файлы в патче")))
+        self.patch_files_table = QTableWidget(0, 2)
+        self.patch_files_table.setHorizontalHeaderLabels(
+            [self.t("Файл в патче"), self.t("Устанавливается в")]
+        )
+        self.patch_files_table.verticalHeader().setVisible(False)
+        self.patch_files_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.patch_files_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.patch_files_table.setAlternatingRowColors(True)
+        self.patch_files_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.patch_files_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.patch_files_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.patch_files_table.setMinimumHeight(180)
+        desc_box.addWidget(self.patch_files_table)
+        layout.addWidget(desc_panel)
+
+        # ---------- 4. Кнопка установки ----------
+        install_row = QHBoxLayout()
+        install_row.addStretch(1)
+        self.patch_install_btn = QPushButton(self.t("Установить"))
+        self.patch_install_btn.setObjectName("Primary")
+        self.patch_install_btn.setMinimumHeight(36)
+        self.patch_install_btn.setEnabled(False)  # включается логикой после загрузки патча
+        self.patch_install_btn.clicked.connect(self._install_patch_clicked)
+        install_row.addWidget(self.patch_install_btn)
+        layout.addLayout(install_row)
+        layout.addStretch(1)
+
+        self.stack.addWidget(page)
+        self.pages["Patch"] = page
+        
+    def refresh_patch_page(self):
+        self._refresh_exe_info_card()
+        self.patch_browse_btn.setEnabled(True)
+        self._reset_patch_state()
+
+    def _refresh_exe_info_card(self) -> None:
+        """Обновляет верхнюю карточку с информацией об активном инстансе."""
+        if not hasattr(self, "patch_name_label"):
+            return
+        instance = self.current_instance()
+        root = self.current_root()
+        if not instance or root is None:
+            self.widgets["patch_instance_name"].setText(self.t("No instance"))
+            self.widgets["patch_instance_path"].setText(self.t("Select a game instance first."))
+            self.widgets["patch_instance_status"].setText("—")
+            self.widgets["patch_instance_version"].setText("—")
+            return
+
+        self.widgets["patch_instance_name"].setText(instance.get("name", root.name))
+        self.widgets["patch_instance_path"].setText(str(root))
+
+        # TODO: получить версию установленного патча. Если нет — "—".
+        current_exe_patch_version = self._get_current_exe_patch_version('str')
+        exe_patch_version = "—"
+        if current_exe_patch_version:
+            exe_patch_version = current_exe_patch_version
+        # patch_version = self._read_installed_patch_version(root) or "—"
+        self.widgets["patch_instance_version"].setText(exe_patch_version)
+
+        # TODO: определить статус инстанса:
+        # "Чистая версия" / "Пропатченная версия" / "Стим версия".
+        # Надо как-то обновлять instance после патчинга, т.к. значения изменились и теперь версия не чистая, а патченная
+        if current_exe_patch_version:
+            status = "Модифицированная версия игры"
+        else:
+            exe_status = instance["exe_validation"]["status"]
+            if exe_status == "clean_standalone":
+                status = "Чистая версия игры"
+            elif exe_status == "clean_steam":
+                status = "Steam версия игры"
+            elif exe_status == "modified_standalone":
+                status = "Модифицированная версия игры"
+            elif exe_status == "modified_steam":
+                status = "Модифицированная Steam версия игры"
+            else:
+                status = "—"
+        # status = self._detect_patch_status(root)
+        self.widgets["patch_instance_status"].setText(status)
+
+    def _choose_patch_file(self) -> None:
+        """Открывает диалог выбора патч-файла."""
+        instance = self.current_instance()
+        if not instance:
+            QMessageBox.information(self, self.t("Warning"), self.t("Select a game instance first."))
+            return
+        if instance["exe_validation"]["status"] in ["clean_steam", "modified_steam"]:
+            message = 'Ваша активная копия игры является Steam версией.\nК сожалению, Steam версия не поддерживает возможность модификации исполняемых файлов и добавления нового функционала.\nНо Вы все еще можете редактировать старые файлы и заменять их на новые!\nЛибо через раздел "Копии игры" добавьте другую копию игры, которую можно будет модифицировать!'
+            QMessageBox.information(self, "Steam версия", message)
+            self.patch_browse_btn.setEnabled(False)
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, self.t("Выбрать патч-файл"), str(Path.home()),
+            self.t("Патч-файл (*.patch);;Все файлы (*.*)"),
+        )
+        if not path:
+            return
+        patch_path = Path(path)
+
+        try:
+            patch_parser = PatchParser(path)
+            self.patch_data = patch_parser.parse_file()
+        except PatchWrongFileError:
+            # Надо бы исправить словарь локализации. ИИ наделал каши.
+            error_txt = f"Файл {patch_path.name} не является патч-файлом. Необходимо указать путь к файлу с расширением .patch!"
+            QMessageBox.information(self, "Неправильно выбран файл", error_txt)
+            self._reset_patch_state()
+            return
+        except (PatchCorruptedFileError, PatchWrongChunkError):
+            error_txt = f"Патч-файл {patch_path.name} критический поврежден! Пожалуйста, расскажите об этом разработчикам!:)"
+            QMessageBox.critical(self, "Критическая ошибка", error_txt)
+            self._reset_patch_state()
+            return
+        except Exception:
+            error_txt = f"При открытии патча произошла непредвиденная ошибка! Пожалуйста, расскажите об этом разработчикам!:)"
+            QMessageBox.critical(self, "Неизвестная ошибка", error_txt)
+            self._reset_patch_state()
+            return
+
+        self.patch_file_path = patch_path
+        self.patch_path_edit.setText(path)
+        self._populate_patch_description()
+
+    def _reset_patch_state(self) -> None:
+        self.patch_file_path = None
+        self.patch_data = None
+        self.patch_path_edit.clear()
+        self._populate_patch_description()
+
+    def _populate_patch_description(self) -> None:
+        """Заполняет блок описания из self.patch_data.
+        Если self.patch_data пуст — показывает заглушки и не даёт установить.
+        """
+        if self.patch_data is None:
+            self.patch_name_label.setText("—")
+            self.patch_version_label.setText("—")
+            self.patch_status_label.setText("—")
+            self.patch_desc_view.setText("")
+            self.patch_files_table.setRowCount(0)
+            self.patch_install_btn.setEnabled(False)
+            return
+
+        self.patch_name_label.setText(self.patch_data.file_name)
+        self.patch_version_label.setText(f"{convert_version_hex_2_str(self.patch_data.file_patch_version)}")
+
+        current_exe_version = self._get_current_exe_patch_version("tuple")
+        if current_exe_version is None:
+            self.patch_status_label.setText("Новая версия патча")
+        else:
+            patch_version = convert_version_hex_2_tuple(self.patch_data.file_patch_version)
+            if patch_version > current_exe_version:
+                self.patch_status_label.setText("Новая версия патча")
+            elif patch_version < current_exe_version:
+                self.patch_status_label.setText("Устаревшая версия патча")
+            else:
+                self.patch_status_label.setText("Патч уже установлен!")
+        # Код языка хранится в self.prefab
+        lang_code = self.prefs["language"]
+        patch_desc = get_patch_description_by_language_code(self.patch_data, lang_code)
+        self.patch_desc_view.setText(patch_desc)
+
+        self.patch_files_table.setRowCount(0)
+        if self.patch_data and 0 < self.patch_data.f_list_count == len(self.patch_data.f_list_list) > 0:
+            for file in self.patch_data.f_list_list:
+                row = self.patch_files_table.rowCount()
+                self.patch_files_table.insertRow(row)
+                game_path = Path(file.game_path)
+                name = game_path.name
+                self.patch_files_table.setItem(row, 0, QTableWidgetItem(name))
+                self.patch_files_table.setItem(row, 1, QTableWidgetItem("\\" + str(game_path)))
+        # Проверка версии лаунчера
+        cur_launcher_version = tuple([int(i) for i in APP_VERSION.split(".")])
+        patch_launcher_version = convert_version_hex_2_tuple(self.patch_data.file_launcher_version)
+        if cur_launcher_version < patch_launcher_version:
+            error_txt = f"""Патч-файл не поддерживается данной версией лаунчера.\nЛаунчер устарел. Обновите его, чтобы установить новый патч!\nВерсия лаунчера: {APP_VERSION}. Необходимая версия: {convert_version_hex_2_str(self.patch_data.file_launcher_version)}."""
+            QMessageBox.information(self, "Обновите лаунчер", error_txt)
+            return
+        # Сделать кнопку установки активной
+        self.patch_install_btn.setEnabled(True)
+
+    def _install_patch_clicked(self) -> None:
+        """Открывает диалог подтверждения и передаёт управление вашей логике."""
+        # НЕОБХОДИМО СДЕЛАТЬ ВСЕ ПРОВЕРКИ ДО ВЫВОДА ОКНА
+        if not self.patch_file_path or not self.patch_data:
+            QMessageBox.warning(self, self.t("Warning"), self.t("Сначала выберите патч-файл."))
+            return
+
+        item = self._get_required_instance()
+        if not item:
+            return
+        instance, root_path, backup = item
+        # 1. Получим путь к активному exe.
+        active_exe_path = services.locate_game_exe(root_path)
+        # 2. Т.к. бэкап - это копия оригинала, то и название exe оригинальное. Возьмеим названиие файла из оригинала и добавим.
+        # Надо добавить проверку на валидность файла? Вдруг файла в бэкап папке не будет, или его удалили, или изменили.
+        # Когда нибудь потом..
+        backup_exe_path = backup / active_exe_path.name
+        if backup_exe_path.exists() is False or backup_exe_path.is_file() is False:
+            # вызов ошибки и уведомления об остсутствии exe???
+            return
+
+        dialog = PatchDisclaimerDialog(
+            self,
+            self.t("Установка патча"),
+            self.patch_data.file_name,
+            convert_version_hex_2_str(self.patch_data.file_patch_version),
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        # TODO: здесь вызовите вашу функцию установки патча.
+        # Внутри можете использовать self.patch_file_path, self.patch_data, root, backup.
+        # Рекомендуется выполнять в фоне через self.run_task(...), чтобы не блокировать UI:
+        #
+        # def task(report):
+        #     report(10, "Установка…")
+        #     return my_install_patch(self.patch_file_path, self.patch_data, root, backup)
+        #
+        # def success(result):
+        #     QMessageBox.information(self, self.t("Success"), self.t("Патч установлен."))
+        #     self._refresh_exe_info_card()
+        #
+        # self.run_task(self.t("Установка патча"), task, success)
+        #
+        # What i need?
+        # 1. PatchStruct, 2. origin_exe_path, 3. backup_exe_path, 4. root_path
+        install_patch(self.patch_data, active_exe_path, backup_exe_path, root_path)
+        # Надо как-то обновлять instance после патчинга, т.к. значения изменились и теперь версия не чистая, а патченная
+        message = f"Патч версии v{convert_version_hex_2_str(self.patch_data.file_patch_version)} успешно установлен!"
+        QMessageBox.information(self, "Патч Установлен.", message)
+        # очистим раздел патча
+        self.refresh_patch_page()
+
+    def _get_current_exe_patch_version(self, format: str | None = None):
+        """
+        Извлекает из exe версию патча, если такова имеется
+        :return:
+        """
+        # 1. Получим путь к активному exe.
+        inst = self.current_instance()
+        exe_path = services.locate_game_exe(Path(inst["path"]))
+        hex_version = 0
+        with exe_path.open("rb") as fb:
+            fb.seek(0x300)
+            magic_string = fb.read(0x10)
+            if magic_string != b"RCCARS MOD PATCH":
+                return None
+            fb.seek(0x320)
+            hex_version = tiohbReadDWord(fb)
+        if format is None:
+            return hex_version
+        elif format == "str":
+            return convert_version_hex_2_str(hex_version)
+        elif format == "tuple":
+            return convert_version_hex_2_tuple(hex_version)
+        else:
+            raise AttributeError("Attribute 'format' can take only None or string value: 'str', 'tuple'.")
+    # ------------------------------------------------------------------
+
     def _build_mods_page(self) -> None:
         scroll = QScrollArea()
         scroll.setObjectName("PageScrollArea")
@@ -848,6 +1266,7 @@ class LauncherWindow(QMainWindow):
         for name, btn in getattr(self, "nav_buttons", {}).items():
             btn.setChecked(name == key)
         if key == "Instances": self.refresh_instances_table()
+        if key == "Patch": self.refresh_patch_page()
         if key == "Mod Manager": self.refresh_mods_table()
         if key == "Tools": self.refresh_tools()
         if key == "Game Settings":
@@ -879,6 +1298,16 @@ class LauncherWindow(QMainWindow):
         self.refresh_everything()
 
     def _get_required_instance(self, feature: str = "") -> Optional[tuple[dict[str, Any], Path, Path]]:
+        """
+        Функция имеет проблему в логике.
+        Передача расширения файла(exe, launch?) через атрибут feature абсолютно ничего не дает!
+        Значение никак не возвращается из функции, хотя ии при вызове этот аргумент использует.
+        И функция уже используется в 12 местах.
+        Либо переписывать логику функции и на всех точках вызова, либо убрать if блок и стереть аргумент в вызовах.
+        2 вариант как-будто лучше.
+        :param feature:
+        :return:
+        """
         instance = self.current_instance()
         if not instance:
             QMessageBox.warning(self, self.t("Warning"), self.t("Select a game instance first."))
@@ -886,21 +1315,23 @@ class LauncherWindow(QMainWindow):
         root = Path(instance["path"]).expanduser()
         backup = self.current_backup_root()
         assert backup is not None
+        #  бесмысленый if блок
         if feature in ("exe", "launch"):
             try:
+                # возаращаемый путь из locate_game_exe не сохраняется в переменную и не возвращается из этой функции
                 services.locate_game_exe(root)
             except FileNotFoundError as exc:
-                QMessageBox.warning(self, self.t("Warning"), str(exc))
+                QMessageBox.warning(self.t("Warning"), str(exc))
                 return None
         return instance, root, backup
 
     def refresh_startup_state(self) -> None:
-        """Refresh only visible/essential data on startup; other tabs load on demand."""
         self._sync_active_combo()
         self.refresh_instances_table()
         self.refresh_home_status()
         self.refresh_mod_access()
         self.refresh_social_links()
+        self._refresh_exe_info_card()
 
     def refresh_everything(self) -> None:
         self._sync_active_combo()
@@ -912,6 +1343,7 @@ class LauncherWindow(QMainWindow):
         self.load_game_settings()
         self.load_graphics_settings()
         self.refresh_social_links()
+        self.refresh_patch_page()
 
     def refresh_home_status(self) -> None:
         instance = self.current_instance()
@@ -1037,8 +1469,6 @@ class LauncherWindow(QMainWindow):
         instance["exe_validation"] = {"status": validation["status"], "sha256": validation["sha256"]}
         backup_root = self.data_dir / "backups" / str(instance["id"])
         try:
-            # Preserve the EXE exactly as it exists at registration time. Later patches
-            # use backup_file_once, so this baseline is never silently overwritten.
             services.backup_file_once(exe.parent, exe, backup_root)
         except OSError as exc:
             QMessageBox.critical(self, self.t("Error"), f"{self.t('Could not back up the game EXE')}:\n{exc}")
@@ -1219,8 +1649,6 @@ class LauncherWindow(QMainWindow):
         idx = self.resolution_combo.findData((width, height))
         self.custom_resolution.blockSignals(True); self.resolution_combo.blockSignals(True)
         if idx < 0:
-            # The INI may contain a valid resolution not advertised as a current display mode.
-            # Add it to the combo instead of silently enabling the user's Custom checkbox.
             label = f"{width} × {height} (current)"
             self.resolution_combo.addItem(label, (width, height))
             idx = self.resolution_combo.findData((width, height))
@@ -1377,8 +1805,6 @@ class LauncherWindow(QMainWindow):
             report(65, "Updating game language…")
             messages.append(services.set_game_language(language))
             dg_conf = root / "dgVoodoo.conf"
-            # Persist these values per instance even before dgVoodoo is installed, so
-            # installing the wrapper later picks up the user's selections.
             services.write_json(backup / "dgvoodoo_settings.json", {
                 "resolution": [int(dg_resolution[0]), int(dg_resolution[1]), int(dg_resolution[2])],
                 "depth_mode": depth_mode,
@@ -1426,12 +1852,10 @@ class LauncherWindow(QMainWindow):
             self._queue_mod_reconcile(instance)
 
     def _queue_mod_reconcile(self, instance: dict[str, Any]) -> None:
-        """Debounce checkbox/removal changes and reconcile the update/ overlay automatically."""
         root = Path(instance["path"]).expanduser()
         instance_id = str(instance["id"])
         backup = self.data_dir / "backups" / instance_id
         backup.mkdir(parents=True, exist_ok=True)
-        # Snapshot records so a background task never observes later UI mutations.
         records = [ModRecord(Path(m.archive), m.name, bool(m.enabled), int(m.order), m.kind)
                    for m in self.mod_records]
         self._pending_mod_apply = (root, instance_id, records, backup)
@@ -1466,7 +1890,6 @@ class LauncherWindow(QMainWindow):
             QMessageBox.critical(self, self.t("Error"), str(exc))
 
     def handle_dropped_mod_archives(self, paths: list[str]) -> None:
-        """Import supported archives dropped anywhere in the Mod Manager page or table."""
         if not self._mods_available():
             QMessageBox.information(self, self.t("No Pack extraction"), self.t("The Mod Manager is available only after RCCars.pack has been extracted. Use the Home page to extract Pack first."))
             return
@@ -1493,7 +1916,6 @@ class LauncherWindow(QMainWindow):
         try:
             record.archive.unlink(missing_ok=True)
             self.refresh_mods_table()
-            # Removing an enabled archive must remove its stale files from update/ as well.
             if instance:
                 self._queue_mod_reconcile(instance)
         except OSError as exc:
@@ -1520,7 +1942,6 @@ class LauncherWindow(QMainWindow):
         if not records:
             if not (root / "update").is_dir():
                 QMessageBox.information(self, self.t("Warning"), self.t("There are no mod archives in Mods yet.")); return
-            # An empty profile is meaningful: Apply can restore files from mods that were removed.
         instance_id = str(instance["id"])
         self.run_task(self.t("Applying enabled mods"), lambda report: apply_mods(root, instance_id, records, backup, report),
                       lambda result: QMessageBox.information(self, self.t("Success"), f"Enabled mods: {result[0]}\nFiles in update/: {result[1]}"))
@@ -1593,15 +2014,9 @@ class LauncherWindow(QMainWindow):
         if not item: return
         _instance, root, backup = item
 
-        # The startup refresh is deliberately deferred until after the window appears;
-        # ensure graphics controls have been loaded for the selected instance before
-        # using their values (but preserve edits for an already loaded instance).
         if self._graphics_instance_id != str(_instance.get("id", "")):
             self.load_graphics_settings()
 
-        # RCCars.crs can be rewritten by the game after it runs. Reapply the selected
-        # launcher resolution immediately before each launch so both persisted slots
-        # (menu and race) are corrected even when record ordering has changed.
         crs_message = "RCCars.crs not present; skipped."
         try:
             if hasattr(self, "resolution_combo"):
@@ -1630,7 +2045,6 @@ class LauncherWindow(QMainWindow):
             process = services.launch_game(root, bool(self.prefs.get("dev_mode", False)))
             self.statusBar().showMessage(f"{self.t('Game process started.')} {crs_message}", 8000)
             if self.prefs.get("close_after_launch", False):
-                # Let Qt flush its final UI events and allow the process to initialize.
                 QTimer.singleShot(250, self.close)
         except Exception as exc:
             QMessageBox.critical(self, self.t("Error"), str(exc))
@@ -1691,8 +2105,6 @@ class LauncherWindow(QMainWindow):
             page_key = "Home"
         self._build_ui()
         self._sync_active_combo()
-        # Show the window before doing filesystem scans and instance detection.
-        # The one-directory build below also avoids PyInstaller one-file extraction at startup.
         QTimer.singleShot(120, self.refresh_startup_state)
         self.show_page(page_key)
 
